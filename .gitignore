@@ -1,0 +1,26 @@
+node_modules/
+.DS_Store
+*.log
+
+# local runtime / agent config
+.env
+.env.*
+!.env.example
+!.env.sample
+.mcp.json
+.claude/
+.pi/
+
+# generated OSINT output; may contain PII
+reports/
+# New local Reddit exports should stay out of source; existing tracked fixtures are historical samples.
+data/*.jsonl
+.references
+
+# local agent/session artifacts
+.pi-subagents/
+.zcode/
+.commandcode/
+
+# downloaded source data and generated identity reports
+data/
