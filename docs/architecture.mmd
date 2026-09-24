@@ -1,0 +1,64 @@
+%% osint-ai — system architecture
+%% Render at https://mermaid.live or in any Mermaid-aware viewer (GitHub/Notion/Obsidian).
+%% For Excalidraw: import the rendered SVG/PNG, or use the "Mermaid → Excalidraw" paste
+%% feature at https://excalidraw.com (it converts Mermaid to editable Excalidraw elements).
+
+flowchart TB
+    %% ── COLLECTION ──
+    subgraph COL["📦 COLLECTION"]
+        direction LR
+        RED["Reddit history<br/>(Arctic Shift JSONL)"]
+        WEB["Open web<br/>(Firecrawl — MCP native)"]
+    end
+
+    %% ── DETERMINISTIC PRE-PASS (the thesis: ground truth before the LLM) ──
+    subgraph PRE["🛡 DETERMINISTIC PRE-PASS — runs FIRST"]
+        SWEEP1["Web sweep<br/>9 platform-targeted queries → scrape → regex<br/><b>detects bridge leads early</b>"]
+    end
+
+    %% ── ANALYSIS (LLM core) ──
+    subgraph LLM["🧠 PROBABILISTIC ANALYSIS — the reasoning core"]
+        direction TB
+        SUB["5 domain sub-agents<br/>identity · location · career · psychology · digital<br/>(map-reduce, chunked, 2-at-a-time)"]
+        CONS["consolidation rounds"]
+        SYN["synthesis agent<br/>tool-calling loop · verifies injected leads"]
+        SUB --> CONS --> SYN
+    end
+
+    %% ── DETERMINISTIC POST-PASS (verify + structure what the LLM produced) ──
+    subgraph POST["🛡 DETERMINISTIC POST-PASS — verify & structure"]
+        EXT["regex extraction<br/>emails + 12-platform handles"]
+        SWEEP2["web sweep (post)<br/>bridge detection · cluster ranking"]
+        FIND["structured findings<br/>strict JSON schema + repair"]
+    end
+
+    %% ── DISSEMINATION ──
+    subgraph DIS["📤 DISSEMINATION"]
+        direction LR
+        MD["markdown report<br/>+ terminal person-brief"]
+        JSON["machine-readable JSON<br/>(diffable over time)"]
+    end
+
+    RED --> SWEEP1
+    WEB -.->|via MCP / HTTP| SWEEP1
+    SWEEP1 -->|"inject leads as<br/>GROUND TRUTH"| SYN
+    RED --> SUB
+    SYN --> EXT --> SWEEP2 --> FIND
+    FIND --> MD
+    FIND --> JSON
+
+    %% ── DUAL RUNTIME (the second impressive thing) ──
+    subgraph RT["⚙️ RUNTIME — two interchangeable backends, same pipeline"]
+        direction LR
+        OA["openai<br/>native function-calling"]
+        CC["claude-code<br/>custom ReAct fences + MCP web<br/>(runs on a Claude/GLM subscription, no API key)"]
+    end
+    RT -.->|drives| LLM
+
+    %% styling
+    classDef guard fill:#1e3a2e,stroke:#2ecc71,color:#fff
+    classDef llmcore fill:#2a1e3a,stroke:#a06cd5,color:#fff
+    classDef plain fill:#1e2a3a,stroke:#5b9bd5,color:#fff
+    class SWEEP1,EXT,SWEEP2,FIND guard
+    class SUB,CONS,SYN llmcore
+    class RED,WEB,MD,JSON,OA,CC plain
