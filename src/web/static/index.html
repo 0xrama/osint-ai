@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="light dark" />
+		<title>osint-ai · case console</title>
+		<link rel="preconnect" href="https://fonts.googleapis.com" />
+		<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+		<!-- Only the weights actually used in styles.css — the default Google
+		     Fonts link pulls ~30 faces when we need 6. -->
+		<link
+			href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Instrument+Serif:ital@0;1&family=Newsreader:ital,opsz,wght@0,6..72,400;1,6..72,400&display=swap"
+			rel="stylesheet"
+		/>
+		<link rel="stylesheet" href="/styles.css" />
+		<!-- Resolve theme before first paint to avoid a light-mode flash. -->
+		<script>
+			(function () {
+				try {
+					var saved = localStorage.getItem("ro-theme");
+					var dark = saved
+						? saved === "dark"
+						: window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+					document.documentElement.dataset.theme = dark ? "dark" : "light";
+				} catch (e) {}
+			})();
+		</script>
+	</head>
+	<body>
+		<div class="ambient" aria-hidden="true"></div>
+		<div class="grain" aria-hidden="true"></div>
+
+		<!-- Classification banner -->
+		<div class="classify" role="banner">
+			<span class="classify-mark" aria-hidden="true"></span>
+			<span class="classify-text">De-anonymization analysis · for authorized OSINT use only · do not redistribute</span>
+			<span class="classify-tag">Restricted</span>
+		</div>
+
+		<div id="app">
+			<aside class="rail" aria-label="Case navigation">
+				<div class="casehead">
+					<div class="casehead-mark">R/O</div>
+					<div class="casehead-text">
+						<strong>osint-ai</strong>
+						<small>SIGINT · IDENTITY RESOLUTION</small>
+					</div>
+				</div>
+
+				<div class="case-id">
+					<span>CONSOLE</span>
+					<span id="sessionId">— · —</span>
+				</div>
+
+				<nav aria-label="Primary">
+					<button class="nav-button active" data-view="dashboard">
+						<span class="nav-index">01</span>
+						<span class="nav-label">Briefing</span>
+						<span class="nav-key">⌂</span>
+					</button>
+					<button class="nav-button" data-view="scan">
+						<span class="nav-index">02</span>
+						<span class="nav-label">Initiate</span>
+						<span class="nav-key">◎</span>
+					</button>
+					<button class="nav-button" data-view="reports">
+						<span class="nav-index">03</span>
+						<span class="nav-label">Dossier</span>
+						<span class="nav-key">▤</span>
+					</button>
+					<button class="nav-button" data-view="compare">
+						<span class="nav-index">04</span>
+						<span class="nav-label">Correlate</span>
+						<span class="nav-key">⇄</span>
+					</button>
+				</nav>
+
+				<div class="rail-meter" aria-label="Provider status">
+					<div class="rail-meter-row">
+						<span>UPLINK</span>
+						<span class="uplink-dot"></span>
+					</div>
+					<div class="rail-meter-row">
+						<span>PROVIDER</span>
+						<strong id="providerLabel">—</strong>
+					</div>
+					<div class="rail-meter-row">
+						<span>CLOCK</span>
+						<strong id="clock">—</strong>
+					</div>
+				</div>
+			</aside>
+
+			<main class="shell">
+				<header class="topbar">
+					<div class="topbar-tools">
+						<button id="refreshButton" class="icon-button" title="Re-sync reports & jobs" aria-label="Refresh">
+							<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M3 12a9 9 0 0 1 15.5-6.3M21 4v5h-5M21 12a9 9 0 0 1-15.5 6.3M3 20v-5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+						</button>
+						<button id="themeToggle" class="icon-button" title="Toggle light / dark" aria-label="Toggle color theme">
+							<svg class="ico-sun" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><circle cx="12" cy="12" r="4.2" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="M12 2.5v2.4M12 19.1v2.4M4.3 4.3l1.7 1.7M18 18l1.7 1.7M2.5 12h2.4M19.1 12h2.4M4.3 19.7 6 18M18 6l1.7-1.7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+							<svg class="ico-moon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg>
+						</button>
+					</div>
+					<div class="metrics">
+						<div class="metric">
+							<span>DOSSIERS</span>
+							<strong id="reportCount">0</strong>
+						</div>
+						<div class="metric">
+							<span>ACTIVE OPS</span>
+							<strong id="activeCount">0</strong>
+						</div>
+						<div class="metric">
+							<span>HARVESTED IDS</span>
+							<strong id="identifierCount">0</strong>
+						</div>
+					</div>
+					<div class="topbar-tail">
+						<span class="blinker"></span>
+						<code>awaiting&nbsp;input</code>
+					</div>
+				</header>
+
+				<!-- 01 · BRIEFING -->
+				<section class="view active" id="view-dashboard">
+					<div class="view-head">
+						<span class="kicker">01 / Briefing Room</span>
+						<h1 class="display">Aggregate <em>exposure</em> across all resolved subjects.</h1>
+					</div>
+
+					<div class="action-grid" aria-label="Primary actions">
+						<button class="action-card primary" data-view="scan">
+							<span class="action-glyph">◎</span>
+							<span class="action-body">
+								<strong>Initiate Investigation</strong>
+								<small>Open a standard or deep sweep on a Reddit handle.</small>
+							</span>
+							<span class="action-arrow">→</span>
+						</button>
+						<button class="action-card" data-view="reports">
+							<span class="action-glyph">▤</span>
+							<span class="action-body">
+								<strong>Open a Dossier</strong>
+								<small>Read a finished report with clues, identifiers &amp; exposure index.</small>
+							</span>
+							<span class="action-arrow">→</span>
+						</button>
+						<button class="action-card" data-view="compare">
+							<span class="action-glyph">⇄</span>
+							<span class="action-body">
+								<strong>Correlate Subjects</strong>
+								<small>Diff two reports for shared identifiers &amp; overlap.</small>
+							</span>
+							<span class="action-arrow">→</span>
+						</button>
+					</div>
+
+					<div class="two-column">
+						<section class="panel">
+							<div class="panel-head">
+								<h2>Recent Dossiers</h2>
+								<button class="text-button" data-view="reports">All files →</button>
+							</div>
+							<div id="recentReports" class="case-stack"></div>
+						</section>
+
+						<section class="panel">
+							<div class="panel-head">
+								<h2>Operations Feed</h2>
+								<button class="text-button" data-view="scan">Console →</button>
+							</div>
+							<div id="scanActivity" class="feed"></div>
+						</section>
+					</div>
+				</section>
+
+				<!-- 02 · INITIATE -->
+				<section class="view" id="view-scan">
+					<div class="view-head">
+						<span class="kicker">02 / Initiate Investigation</span>
+						<h1 class="display">Commission a new <em>identity sweep</em>.</h1>
+					</div>
+
+					<div class="workspace">
+						<section class="panel scan-panel">
+							<div class="panel-head">
+								<h2>Run Parameters</h2>
+								<span class="chip">backend · audit pipeline</span>
+							</div>
+							<form id="scanForm" class="scan-form">
+								<label class="field">
+									<span>Subject handle</span>
+									<input name="username" autocomplete="off" placeholder="u/example_user" required />
+								</label>
+								<label class="field">
+									<span>Identity hypothesis</span>
+									<input name="subjectName" autocomplete="off" placeholder="optional candidate name" />
+								</label>
+								<label class="field">
+									<span>Provider</span>
+									<select name="provider">
+										<option value="auto">Auto</option>
+										<option value="claude-code">Claude Code</option>
+										<option value="codex-cli">Codex CLI</option>
+										<option value="pi">Pi</option>
+										<option value="antigravity">Antigravity</option>
+										<option value="openai">OpenAI-compatible</option>
+									</select>
+								</label>
+								<label class="field">
+									<span>Model override</span>
+									<input name="model" autocomplete="off" placeholder="optional" />
+								</label>
+								<label class="field narrow">
+									<span>Lookback (years)</span>
+									<input name="years" type="number" min="1" max="20" value="7" />
+								</label>
+								<div class="toggle-row">
+									<label class="toggle"><input name="deep" type="checkbox" checked /><span>Deep</span></label>
+									<label class="toggle"><input name="web" type="checkbox" checked /><span>Web</span></label>
+									<label class="toggle"><input name="json" type="checkbox" /><span>JSON</span></label>
+								</div>
+								<button class="submit-button" type="submit">
+									<span>Initiate Sweep</span>
+									<span class="submit-arrow">→</span>
+								</button>
+							</form>
+						</section>
+
+						<section class="panel live-panel">
+							<div class="panel-head">
+								<h2>Live Telemetry</h2>
+								<span id="liveStatus" class="stamp idle">idle</span>
+							</div>
+							<div id="liveLog" class="log"></div>
+						</section>
+					</div>
+				</section>
+
+				<!-- 03 · DOSSIER -->
+				<section class="view" id="view-reports">
+					<div class="view-head row">
+						<div>
+							<span class="kicker">03 / Dossier Library</span>
+							<h1 class="display">Filed <em>identity resolutions</em>.</h1>
+						</div>
+						<label class="field search-field">
+							<span>Filter</span>
+							<input id="reportSearch" class="search" placeholder="handle · file · risk · keyword" />
+						</label>
+					</div>
+
+					<section class="panel dossier-panel">
+						<div class="dossier-layout">
+							<div class="dossier-index">
+								<div class="panel-head tight">
+									<h2>Files</h2>
+									<span class="chip" id="fileCount">0</span>
+								</div>
+								<div id="reportRows" class="file-list"></div>
+							</div>
+							<article id="reportPreview" class="dossier-body"></article>
+						</div>
+					</section>
+				</section>
+
+				<!-- 04 · CORRELATE -->
+				<section class="view" id="view-compare">
+					<div class="view-head">
+						<span class="kicker">04 / Correlation</span>
+						<h1 class="display">Diff two dossiers for <em>shared identifiers</em>.</h1>
+					</div>
+					<section class="panel">
+						<div class="panel-head">
+							<h2>Pairing</h2>
+							<span class="chip">deterministic overlap</span>
+						</div>
+						<div class="compare-controls">
+							<label class="field">
+								<span>Subject A</span>
+								<select id="leftReport"></select>
+							</label>
+							<span class="compare-x">×</span>
+							<label class="field">
+								<span>Subject B</span>
+								<select id="rightReport"></select>
+							</label>
+							<button id="compareButton" class="submit-button compact">Correlate →</button>
+						</div>
+						<div id="compareResult" class="compare-result"></div>
+					</section>
+				</section>
+			</main>
+		</div>
+
+		<script src="/app.js" type="module"></script>
+	</body>
+</html>
