@@ -2,17 +2,12 @@
  * Unified audit pipeline.
  *
  * One entry point (`runAudit`) drives the whole tool and reports progress via
- * callbacks, so the TUI stays a thin view layer. Paths:
+ * callbacks, so the CLI / dashboard stay thin view layers.
  *
- *   Deep mode:  ensure local JSONL (download if missing) → multi-agent
- *               deep-analysis → synthesis report. Falls back to the live
- *               agent if no data can be obtained.
- *   Standard:   live tool-driven agent (reddit_search / web tools).
- *
- * Web intelligence (Firecrawl) is owned by the agents themselves now: in deep
- * mode the synthesis agent gets web_search/web_scrape, and in standard mode
- * the live agent has them. Everything runs on the centralized OpenAI client /
- * model registry.
+ * There is one analysis path: ensure local JSONL (download if missing) →
+ * multi-agent deep-analysis → synthesis report. Only if no data can be
+ * downloaded does it fall back to the live tool-driven agent
+ * (reddit_search / web tools), which fetches history itself.
  */
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -35,7 +30,6 @@ import type { Candidate } from "../types.ts";
 
 export interface AuditOptions {
 	username: string;
-	deep: boolean;
 	years: number;
 	web: boolean;
 	/** Opt-in Twitter/X pass via the operator's twitter-cli (--twitter). */
@@ -289,14 +283,14 @@ async function ensureLocalData(
 	return { posts, comments };
 }
 
-/** Standard path: live tool-driven agent. */
+/** Fallback path when no archive could be downloaded: live tool-driven agent. */
 async function runLiveAgent(opts: AuditOptions, callbacks: AuditCallbacks, webContextText = ""): Promise<AuditResult> {
-	const { username, deep, years, web, candidate } = opts;
+	const { username, years, web, candidate } = opts;
 	const log = callbacks.onProgress ?? (() => {});
 	const status = callbacks.onStatus ?? (() => {});
 
 	status(`Analyzing u/${username} (live agent)`);
-	log(`[agent] Live-agent scan (deep=${deep}, years=${years}, web=${web})`);
+	log(`[agent] Live-agent scan (years=${years}, web=${web})`);
 
 	// Web research: claude-code can use the Firecrawl MCP server natively (no
 	// ReAct web tools); openai, codex-cli, pi, and antigravity use our app-owned ReAct web tools.
@@ -307,7 +301,6 @@ async function runLiveAgent(opts: AuditOptions, callbacks: AuditCallbacks, webCo
 		log(`[web] Firecrawl tools requested but unavailable; continuing with Reddit-only analysis.`);
 	}
 	const tools = buildRuntimeTools({
-		deepDefault: deep,
 		yearsDefault: years,
 		enableWeb: webAvailable && !viaMcp,
 		log: (message) => {
@@ -319,7 +312,7 @@ async function runLiveAgent(opts: AuditOptions, callbacks: AuditCallbacks, webCo
 
 	const result = await runAgentWithTools({
 		systemPrompt,
-		userPrompt: buildUserPrompt({ username, deep, years, web: webAvailable, candidate, webContextText }),
+		userPrompt: buildUserPrompt({ username, years, web: webAvailable, candidate, webContextText }),
 		tools,
 		maxIterations: 10,
 		callbacks: {
@@ -341,7 +334,7 @@ async function runLiveAgent(opts: AuditOptions, callbacks: AuditCallbacks, webCo
 
 /** Run the full audit. */
 export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {}): Promise<AuditResult> {
-	const { username, deep, years, web, twitter: useTwitter, dataDir, candidate } = opts;
+	const { username, years, web, twitter: useTwitter, dataDir, candidate } = opts;
 	const log = callbacks.onProgress ?? (() => {});
 	const status = callbacks.onStatus ?? (() => {});
 
@@ -517,43 +510,36 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		}
 	}
 
-	if (deep) {
-		status(`Preparing deep scan for u/${username}...`);
-		const local = await ensureLocalData(username, years, dataDir, log);
+	status(`Preparing deep scan for u/${username}...`);
+	const local = await ensureLocalData(username, years, dataDir, log);
 
-		if (local) {
-			log(`\n🔬 Multi-Agent Deep Analysis: ${local.posts.length} posts + ${local.comments.length} comments\n`);
-			const result = await runDeepAnalysis(username, local.posts, local.comments, candidate, (msg) => {
-				status(msg);
-				log(msg);
-			}, {
-				web: opts.web,
-				webContextText,
-				// Ground-truth handles from the deterministic passes feed the relevance
-				// ranker — items mentioning these survive the per-domain cap.
-				knownHandles: [
-					...(webSweep?.bridgeOwnerHandles ?? []),
-					...(webSweep?.identifiers.socialHandles ?? []).map((h) => h.handle),
-					...(gitHub?.identities ?? []).map((i) => i.login),
-					...altLeadHandles,
-				],
-			});
-			content = formatDeepAnalysisReport(result);
-			toolCalls = 0;
-			iterations = result.subAgentResults.length;
-			corpusIdentifiers = result.directIdentifiers;
-			modelMentionedIdentifiers = result.modelMentionedIdentifiers;
-			ranDeep = true;
-			structured = result.structured;
-			log(`\n📄 Deep analysis complete — ${result.subAgentResults.length} sub-agents in ${(result.stats.total_duration_ms / 1000).toFixed(1)}s`);
-		} else {
-			log(`[deep] No local data; falling back to live agent scan...`);
-			const live = await runLiveAgent(opts, callbacks, webContextText);
-			content = live.content;
-			toolCalls = live.toolCalls;
-			iterations = live.iterations;
-		}
+	if (local) {
+		log(`\n🔬 Multi-Agent Deep Analysis: ${local.posts.length} posts + ${local.comments.length} comments\n`);
+		const result = await runDeepAnalysis(username, local.posts, local.comments, candidate, (msg) => {
+			status(msg);
+			log(msg);
+		}, {
+			web: opts.web,
+			webContextText,
+			// Ground-truth handles from the deterministic passes feed the relevance
+			// ranker — items mentioning these survive the per-domain cap.
+			knownHandles: [
+				...(webSweep?.bridgeOwnerHandles ?? []),
+				...(webSweep?.identifiers.socialHandles ?? []).map((h) => h.handle),
+				...(gitHub?.identities ?? []).map((i) => i.login),
+				...altLeadHandles,
+			],
+		});
+		content = formatDeepAnalysisReport(result);
+		toolCalls = 0;
+		iterations = result.subAgentResults.length;
+		corpusIdentifiers = result.directIdentifiers;
+		modelMentionedIdentifiers = result.modelMentionedIdentifiers;
+		ranDeep = true;
+		structured = result.structured;
+		log(`\n📄 Deep analysis complete — ${result.subAgentResults.length} sub-agents in ${(result.stats.total_duration_ms / 1000).toFixed(1)}s`);
 	} else {
+		log(`[deep] No local data; falling back to live agent scan...`);
 		const live = await runLiveAgent(opts, callbacks, webContextText);
 		content = live.content;
 		toolCalls = live.toolCalls;
@@ -576,7 +562,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// identifiers are intentionally excluded from this headline set.
 	const directIdentifiers = mergeIdentifiersForDisplay(identifierCollections);
 
-	// Standard / live path has no raw corpus in hand. Identifiers extracted
+	// Live fallback path has no raw corpus in hand. Identifiers extracted
 	// from the report text are MODEL-MENTIONED (unverified) — never treated as
 	// deterministic and never counted as an independent corroboration source.
 	// (The deep path already produced + rendered corpus identifiers and ran the
@@ -645,7 +631,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 
 	const json = {
 		username,
-		mode: deep ? `deep:${years}yr` : "standard",
+		mode: ranDeep ? `deep:${years}yr` : "live-fallback",
 		web,
 		twitter: !!useTwitter,
 		candidate: candidate?.name,

@@ -86,7 +86,7 @@ export function resolveModel(role: ModelRole = "subagent"): string {
   return registered ?? DEFAULT_MODEL;
 }
 
-/** Human-readable summary of the active provider + role split, for logs / TUI. */
+/** Human-readable summary of the active provider + role split, for logs. */
 export function describeModels(): string {
   const provider = resolveProvider();
   if (provider === "claude-code") {

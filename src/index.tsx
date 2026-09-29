@@ -13,16 +13,15 @@
  *
  * Usage:
  *   bun run src/index.tsx                          # interactive CLI
- *   bun run src/index.tsx <username>               # standard scan
- *   bun run src/index.tsx -f <username>            # full investigation (deep + web + twitter)
+ *   bun run src/index.tsx <username>               # scan (download archive + multi-agent analysis)
+ *   bun run src/index.tsx -f <username>            # full investigation (+ web + twitter)
  *   bun run src/index.tsx -f -c <username>         # full investigation, then chat with the verdict
- *   bun run src/index.tsx --deep --years 10 --web <username>
+ *   bun run src/index.tsx --years 10 --web <username>
  *   bun run src/index.tsx --twitter <username>           # twitter-cli identity pass (burner account, read-only)
  *   bun run src/index.tsx --provider pi <username>            # use local pi session
  *   bun run src/index.tsx --provider antigravity <username>   # use local antigravity session
  *   bun run src/index.tsx --provider codex-cli <username>     # use local codex session
  *   bun run src/index.tsx --subject-name "Jane Doe" --web <username>
- *   bun run src/index.tsx --tui                    # legacy OpenTUI interface
  *   bun run src/index.tsx --chat <username>        # chat about the latest saved report
  *   bun run src/index.tsx --init-env               # create .env.local template
  *   bun run src/index.tsx --list-models            # list provider model ids
@@ -39,11 +38,12 @@ import { runAudit, saveReport, saveJsonReport, type AuditCallbacks } from "./ana
 import { startChatRepl, type ChatContext } from "./analysis/chat.ts";
 
 interface CliOptions {
-	deep: boolean;
+	/** Set by --deep: a no-op for analysis (every scan is deep), but still marks
+	 *  "run a scan" so `-d -c <user>` scans before chatting. */
+	scan: boolean;
 	web: boolean;
 	twitter: boolean;
 	years: number;
-	tui: boolean;
 	listModels: boolean;
 	json: boolean;
 	chat: boolean;
@@ -75,23 +75,21 @@ osint-ai — OSINT AI CLI (OpenAI-compatible)
 
 Usage:
   bun run src/index.tsx                              Interactive CLI prompts
-  bun run src/index.tsx <username>                   Run a standard scan
-  bun run src/index.tsx -f <username>                Full investigation (deep + web + twitter) in one flag
+  bun run src/index.tsx <username>                   Download the archive and run the multi-agent scan
+  bun run src/index.tsx -f <username>                Full investigation (+ web + twitter) in one flag
   bun run src/index.tsx -f -c <username>             Full investigation, then chat with the verdict
-  bun run src/index.tsx --deep <username>            Deep multi-agent scan
-  bun run src/index.tsx --deep --years 10 <username> Deep scan (10 years)
+  bun run src/index.tsx --years 10 <username>        Scan 10 years of history
   bun run src/index.tsx --web <username>             Enable Firecrawl web tools
   bun run src/index.tsx --subject-name "Full Name" --web <username>
                                                      Test a candidate identity hypothesis
   bun run src/index.tsx --chat <username>            Chat about the latest saved report
-  bun run src/index.tsx --tui                        Legacy OpenTUI interface
   bun run src/index.tsx --init-env                   Create .env.local template
   bun run src/index.tsx --list-models                List model ids from OPENAI_BASE_URL
 
 Options:
-  -f, --full        Full investigation: --deep + --web + --twitter in one flag
-  -d, --deep        Deep multi-agent scan (downloads JSONL, dispatches sub-agents)
-  -y, --years N     Years to scan back (default: 7 for deep)
+  -f, --full        Full investigation: --web + --twitter in one flag
+  -y, --years N     Years to scan back (default: 7)
+  -d, --deep        No-op, kept for old commands (every scan is deep)
   -w, --web         Enable Firecrawl web intelligence enrichment
   -t, --twitter     Enable the Twitter/X identity pass via twitter-cli (burner account; read-only)
   -j, --json        Emit machine-readable JSON (findings + direct identifiers) instead of a markdown report
@@ -99,7 +97,6 @@ Options:
       --provider X  LLM backend: 'openai', 'claude-code', 'codex-cli', 'pi', or 'antigravity'. Default: auto-detect
       --model X     Override the model id (else OPENAI_MODEL / CLAUDE_CODE_MODEL / CODEX_CLI_MODEL / PI_MODEL / ANTIGRAVITY_MODEL / role defaults)
       --subject-name X  Optional candidate real-world identity to verify against the evidence
-      --tui         Launch the legacy full-screen TUI
       --init-env    Create a .env.local template if missing
       --list-models Query the configured OpenAI-compatible /models endpoint
   -h, --help        Show this help
@@ -137,11 +134,10 @@ loadEnvFile();
 
 function parseArgs(argv: string[]): CliOptions {
 		const parsed: CliOptions = {
-			deep: false,
+			scan: false,
 			web: false,
 			twitter: false,
 			years: 7,
-			tui: false,
 			listModels: false,
 			json: false,
 			chat: false,
@@ -153,16 +149,14 @@ function parseArgs(argv: string[]): CliOptions {
 
 		for (let i = 0; i < argv.length; i++) {
 			const arg = argv[i];
-			if (arg === "--deep" || arg === "-d") parsed.deep = true;
+			if (arg === "--deep" || arg === "-d") parsed.scan = true;
 			else if (arg === "--web" || arg === "-w") parsed.web = true;
 			else if (arg === "--twitter" || arg === "-t") parsed.twitter = true;
 			else if (arg === "--full" || arg === "-f") {
-				// One-shot full investigation: deep + web + twitter.
-				parsed.deep = true;
+				// One-shot full investigation: web + twitter.
 				parsed.web = true;
 				parsed.twitter = true;
 			}
-			else if (arg === "--tui") parsed.tui = true;
 		else if (arg === "--list-models") parsed.listModels = true;
 		else if (arg === "--json" || arg === "-j") parsed.json = true;
 		else if (arg === "--chat" || arg === "-c") parsed.chat = true;
@@ -277,17 +271,13 @@ async function readInteractiveOptions(options: CliOptions): Promise<CliOptions> 
 			}
 		}
 
-		const deepAnswer = await rl.question(`Deep multi-agent scan? [${options.deep ? "Y/n" : "y/N"}] `);
-		options.deep = resolveYes(deepAnswer, options.deep);
-		if (options.deep) {
-			const yearsAnswer = await rl.question(`Years to scan back [${options.years}]: `);
-			if (yearsAnswer.trim()) {
-				const years = Number.parseInt(yearsAnswer, 10);
-				if (!Number.isFinite(years) || years < 1 || years > 20) {
-					throw new Error("Years must be a number from 1 to 20.");
-				}
-				options.years = years;
+		const yearsAnswer = await rl.question(`Years to scan back [${options.years}]: `);
+		if (yearsAnswer.trim()) {
+			const years = Number.parseInt(yearsAnswer, 10);
+			if (!Number.isFinite(years) || years < 1 || years > 20) {
+				throw new Error("Years must be a number from 1 to 20.");
 			}
+			options.years = years;
 		}
 
 		options.web = resolveYes(
@@ -341,38 +331,12 @@ async function listModels(options: CliOptions): Promise<never> {
 	}
 }
 
-async function launchTui(options: CliOptions): Promise<void> {
-	assertLLMConfig({ provider: options.provider });
-
-	const [{ createCliRenderer }, { createRoot }, { App }] = await Promise.all([
-		import("@opentui/core"),
-		import("@opentui/react"),
-		import("./tui/App.tsx"),
-	]);
-
-	const renderer = await createCliRenderer({
-		exitOnCtrlC: false,
-		targetFps: 30,
-	});
-
-	createRoot(renderer).render(
-		<App
-			initialUsername={options.username}
-			initialDeep={options.deep}
-			initialYears={options.years}
-			initialWeb={options.web}
-			initialSubjectName={options.subjectName}
-			autoStart={!!options.username}
-		/>,
-	);
-}
-
 async function runCli(options: CliOptions): Promise<void> {
 	if (!options.username) options = await readInteractiveOptions(options);
 	validateUsername(options.username);
 	assertLLMConfig({ provider: options.provider });
 
-	const mode = options.deep ? `deep ${options.years}yr` : "standard";
+	const mode = `${options.years}yr`;
 	const extras = [
 		options.web ? "Firecrawl" : null,
 		options.twitter ? "Twitter" : null,
@@ -419,7 +383,6 @@ async function runCli(options: CliOptions): Promise<void> {
 		const result = await runAudit(
 			{
 				username: options.username,
-				deep: options.deep,
 				years: options.years,
 				web: options.web,
 				twitter: options.twitter,
@@ -499,12 +462,11 @@ if (options.model) {
 
 try {
 	if (options.listModels) await listModels(options);
-	else if (options.tui) await launchTui(options);
-	else if (options.chat && !options.username && !(options.deep || options.web || options.twitter)) {
+	else if (options.chat && !options.username && !(options.scan || options.web || options.twitter)) {
 		// Bare `--chat` (no scan flags, no positional) is nonsensical.
 		console.error("--chat requires a username: bun run src/index.tsx --chat <username>");
 		process.exit(1);
-	} else if (options.chat && !(options.deep || options.web || options.twitter)) {
+	} else if (options.chat && !(options.scan || options.web || options.twitter)) {
 		// --chat <username>: chat about the latest saved report (no scan flags).
 		validateUsername(options.username);
 		assertLLMConfig({ provider: options.provider });

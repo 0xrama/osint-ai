@@ -908,7 +908,7 @@ function renderScanActivity() {
 		<div class="feed-item">
 			<div>
 				<strong>u/${escapeHtml(j.options.username)}</strong>
-				<small>${j.options.deep ? "deep" : "standard"}${j.options.web ? " · web" : ""} · ${formatDate(j.startedAt)}</small>
+				<small>${j.options.years}yr${j.options.web ? " · web" : ""} · ${formatDate(j.startedAt)}</small>
 			</div>
 			<span class="stamp ${j.status}">${j.status}</span>
 		</div>`,
@@ -1072,7 +1072,6 @@ async function submitScan(event) {
 		provider: form.get("provider"),
 		model: form.get("model"),
 		years: Number(form.get("years")),
-		deep: form.has("deep"),
 		web: form.has("web"),
 		json: form.has("json"),
 	};

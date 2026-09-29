@@ -82,7 +82,7 @@ Force one with `LLM_PROVIDER=openai|claude-code|codex-cli|pi|antigravity` or `--
 
 ```
 src/
-  index.tsx                     CLI entry point (+ legacy --tui launcher)
+  index.tsx                     CLI entry point
   prompts.ts                    Top-level analyst system/user prompts (de-anonymization posture)
   types.ts                      Shared types (Candidate, FilteredItem, ToolDefinition, ...)
   config/
@@ -138,12 +138,11 @@ src/
     filter.ts                   Heuristic filtering
   integrations/
     linkedin.ts                 Browser Use LinkedIn search (optional, needs BROWSER_USE_API_KEY)
-  tui/                          Legacy full-screen OpenTUI interface (App/AnalysisView/...)
 ```
 
 ### Data flow
 
-- **Deep path (`--deep`):** `ensureLocalData` (download JSONL via Arctic Shift) →
+- **Main path (every scan; `--deep` is a no-op kept for old commands):** `ensureLocalData` (download JSONL via Arctic Shift) →
   **web sweep runs FIRST** (ground-truth leads) → **GitHub pass** (seeded with
   the sweep's ranked handles; independent of Firecrawl) → optional
   **Twitter pass** (`--twitter`, independent of Firecrawl, seeded with bridge
@@ -152,9 +151,9 @@ src/
   synthesis agent (gets the sweep + GitHub + Twitter leads injected into its
   prompt) → deterministic identifier extraction → structured-findings JSON
   pass → report.
-- **Standard path:** live tool-driven agent (`runAgentWithTools` with
-  `reddit_search` + web tools, sweep leads injected into the user prompt) →
-  streamed report.
+- **Fallback path (only when the archive download returns nothing):** live
+  tool-driven agent (`runAgentWithTools` with `reddit_search` + web tools,
+  sweep leads injected into the user prompt) → streamed report.
 - **Both paths then:** optional LinkedIn post-pass → merge sweep identifiers →
   render markdown report → `extractReportBrief()` for the terminal summary.
 
@@ -218,7 +217,7 @@ consent/waiver concept in the code anymore; don't reintroduce one.
 - **Language:** TypeScript, ESM, run with [Bun](https://bun.sh). `.ts`/`.tsx`,
   imports use the `.ts` extension (`allowImportingTsExtensions`).
 - **Indentation:** MIXED by file. TABS: `runtime/`, `pipeline.ts`, `filter.ts`,
-  `index.tsx`, `tui/`, `prompts.ts`, `types.ts`. 2 SPACES: `deep-analysis.ts`,
+  `index.tsx`, `prompts.ts`, `types.ts`. 2 SPACES: `deep-analysis.ts`,
   `extract.ts`, `findings.ts`, `web-sweep.ts`, `site-follower.ts`,
   `github-pass.ts`, `twitter-pass.ts`, `corroboration.ts`, `evidence.ts`,
   `runtime/agent.ts`. (This doc previously claimed the
@@ -242,7 +241,7 @@ consent/waiver concept in the code anymore; don't reintroduce one.
 - **No external state.** Pure functions where possible; the only memoization is
   the LLM client cache in `providers/index.ts` (reset on provider change).
 - **Progress callbacks.** Long-running functions take an `onProgress?`/`onStatus?`
-  callback and report phase changes. The TUI is a thin view over these.
+  callback and report phase changes. The CLI and web dashboard are thin views over these.
 
 ### Things already removed (don't bring them back)
 - `AuthorizedSubject` / `consentWaiver` / `--consent-waiver` / `formatAuthorizationContext`
@@ -287,20 +286,18 @@ instance. If web tools break, check this first.
 
 ```bash
 # Run (from repo root)
-bun run src/index.tsx -f <username>                     # FULL investigation in one flag (deep + web + twitter)
+bun run src/index.tsx -f <username>                     # FULL investigation in one flag (web + twitter)
 bun run src/index.tsx -f -c <username>                  # full investigation, then chat with the verdict
-bun run src/index.tsx --deep --web <username>          # full deep scan (what we usually run)
-bun run src/index.tsx --web <username>                 # standard live-agent scan
-bun run src/index.tsx --deep --web --json <username>   # JSON output
-bun run src/index.tsx --deep --web --twitter <username>  # + Twitter/X pass (twitter-cli, burner account)
+bun run src/index.tsx --web <username>                 # scan with web enrichment (what we usually run)
+bun run src/index.tsx --web --json <username>          # JSON output
+bun run src/index.tsx --web --twitter <username>       # + Twitter/X pass (twitter-cli, burner account)
 bun run src/index.tsx --provider openai <username>     # force API backend (faster)
 bun run src/index.tsx --chat <username>                # chat with the latest saved report
-bun run src/index.tsx --deep --web --chat <username>   # scan, then chat with the verdict
-bun run src/index.tsx --tui                            # legacy full-screen UI
+bun run src/index.tsx --web --chat <username>          # scan, then chat with the verdict
 bun run src/index.tsx --help
 
-# Shorthand flags (same long options): -d/--deep, -w/--web, -t/--twitter,
-# -y/--years, -j/--json, -c/--chat, -f/--full (deep+web+twitter).
+# Shorthand flags (same long options): -w/--web, -t/--twitter, -y/--years,
+# -j/--json, -c/--chat, -f/--full (web+twitter). -d/--deep is a no-op.
 # npm scripts: bun run full -- <username>, bun run chat -- <username>.
 #              bun run osint -- <username> is the generic entry alias.
 
@@ -314,7 +311,7 @@ Reports → `reports/report_<username>_<timestamp>.md` (gitignored). Downloaded
 Reddit data → `data/*.jsonl` (gitignored).
 
 ### Typical timing (claude-code/GLM, ~25-item account)
-Standard: ~9–10 min. Deep+web: ~5–11 min. Big accounts (multi-chunk
+Scan + web: ~5–11 min. Big accounts (multi-chunk
 consolidation): 20–40 min. The `claude -p` cold-start per call dominates;
 `--provider openai` is ~half the time.
 

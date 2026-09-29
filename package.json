@@ -12,18 +12,13 @@
     "full": "bun run src/index.tsx --full",
     "chat": "bun run src/index.tsx --chat",
     "dashboard": "bun run src/web/server.ts",
-    "tui": "bun run src/index.tsx --tui",
-    "download": "bun run src/reddit/download.ts",
     "init-env": "bun run src/index.tsx --init-env",
     "typecheck": "bunx tsc --noEmit",
     "lint": "bun run typecheck",
     "test": "bun test"
   },
   "dependencies": {
-    "@opentui/core": "^0.4.0",
-    "@opentui/react": "^0.4.0",
     "openai": "^6.42.0",
-    "react": "^19.2.7",
     "zod": "^4.4.3"
   },
   "devDependencies": {

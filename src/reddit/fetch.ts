@@ -651,34 +651,6 @@ export function formatThreadContext(ctx: ThreadContext | null): string {
 
 // ── Main fetch functions ─────────────────────────────────────────────────
 
-/** Standard fetch — limited to ~2 years of history for API-friendliness */
-export async function fetchUser(username: string, years = 2): Promise<DeepFetchResult> {
-	console.error(`[fetch] Fetching u/${username} (standard mode, last ${years} years)...`);
-
-	// Only look back `years` years to avoid hammering the API
-	const cutoffSec = Math.floor((Date.now() - years * 365.25 * 24 * 60 * 60 * 1000) / 1000);
-	const nowSec = Math.floor(Date.now() / 1000) + 86400;
-
-	const [arcticPosts, arcticComments, ppPosts, ppComments] = await Promise.all([
-		safeFetch("Arctic Shift posts", () => fetchAllArcticInWindow("posts", username, cutoffSec, nowSec)),
-		safeFetch("Arctic Shift comments", () => fetchAllArcticInWindow("comments", username, cutoffSec, nowSec)),
-		safeFetch("PullPush posts", () => fetchAllPullpushInWindow("submission", username, cutoffSec, nowSec)),
-		safeFetch("PullPush comments", () => fetchAllPullpushInWindow("comment", username, cutoffSec, nowSec)),
-	]);
-
-	const allPosts = dedupPosts([
-		...arcticPosts.map((r) => normalizePost(r, "arctic-shift")),
-		...ppPosts.map((r) => normalizePost(r, "pullpush")),
-	]);
-
-	const allComments = dedupComments([
-		...arcticComments.map((r) => normalizeComment(r, "arctic-shift")),
-		...ppComments.map((r) => normalizeComment(r, "pullpush")),
-	]);
-
-	return buildResult(username, allPosts, allComments, years);
-}
-
 /**
  * Deep scan — fetches 5-7+ years of data by iterating through yearly/monthly
  * time windows. This bypasses API per-query item limits.

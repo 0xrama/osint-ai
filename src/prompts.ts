@@ -44,7 +44,6 @@ REPORT STRUCTURE
 
 export interface UserPromptOptions {
 	username: string;
-	deep: boolean;
 	years: number;
 	web: boolean;
 	candidate?: Candidate;
@@ -69,11 +68,9 @@ export function formatObjectiveContext(candidate?: Candidate): string {
 	return `Objective: determine the real-world identity behind u/{username} from the Reddit evidence and web research alone.`;
 }
 
-/** Build the user prompt for the standard live-agent path. */
+/** Build the user prompt for the live-agent fallback path. */
 export function buildUserPrompt(opts: UserPromptOptions): string {
-	const depthInstruction = opts.deep
-		? `Use reddit_search with deep=true and years=${opts.years}.`
-		: `Use reddit_search without deep mode unless more history is necessary.`;
+	const depthInstruction = `Use reddit_search with years=${opts.years}.`;
 	const webInstruction = opts.web
 		? `Firecrawl web tools (web_search, web_scrape) are ENABLED. Use them aggressively and iteratively to hunt cross-platform identities and verify the person. Cite URLs.`
 		: `Firecrawl web tools are disabled; use only Reddit data.`;

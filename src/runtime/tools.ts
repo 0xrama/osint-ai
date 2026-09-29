@@ -1,5 +1,4 @@
 import {
-	fetchUser,
 	fetchUserDeep,
 	enrichWithThreadContext,
 	formatForLLM,
@@ -79,7 +78,6 @@ export function buildWebTools(): ToolDefinition[] {
 }
 
 export function buildRuntimeTools(options: {
-	deepDefault: boolean;
 	yearsDefault: number;
 	log?: (message: string) => void;
 	enableWeb?: boolean;
@@ -88,26 +86,22 @@ export function buildRuntimeTools(options: {
 	const tools: ToolDefinition[] = [
 		{
 			name: "reddit_search",
-			description: "Fetch Reddit posts and comments for a Reddit account to extract identity-relevant signals. Supports deep historical scanning and thread context for sarcasm/irony detection.",
+			description: "Fetch Reddit posts and comments for a Reddit account (deep historical scan) to extract identity-relevant signals. Includes thread context for sarcasm/irony detection.",
 			parameters: {
 				type: "object",
 				properties: {
 					username: { type: "string", description: "Reddit username without u/ prefix" },
-					deep: { type: "boolean", description: "Use deep historical scanning" },
 					years: { type: "number", description: "Years to scan back" },
 				},
 				required: ["username"],
 			},
-			execute: async (params: { username: string; deep?: boolean; years?: number }) => {
-				const deep = params.deep ?? options.deepDefault;
-				const years = params.years ?? (deep ? options.yearsDefault : 2);
-				const key = `${params.username}:${deep}:${years}`;
+			execute: async (params: { username: string; years?: number }) => {
+				const years = params.years ?? options.yearsDefault;
+				const key = `${params.username}:${years}`;
 				let result = fetchCache.get(key);
 				if (!result) {
-					log(deep ? `[reddit] Deep scan u/${params.username} (${years} years)` : `[reddit] Fetch u/${params.username}`);
-					result = deep
-						? await fetchUserDeep(params.username, years, (current, total, label) => log(`[reddit] ${label} (${current}/${total})`))
-						: await fetchUser(params.username);
+					log(`[reddit] Deep scan u/${params.username} (${years} years)`);
+					result = await fetchUserDeep(params.username, years, (current, total, label) => log(`[reddit] ${label} (${current}/${total})`));
 					fetchCache.set(key, result);
 				} else {
 					log(`[reddit] Reusing cached fetch for u/${params.username}`);
@@ -138,15 +132,15 @@ export function buildRuntimeTools(options: {
 				type: "object",
 				properties: {
 					username: { type: "string", description: "Reddit username without u/ prefix" },
-					deep: { type: "boolean", description: "Use deep historical scanning" },
 					years: { type: "number", description: "Years to scan back" },
 				},
 				required: ["username"],
 			},
-			execute: async (params: { username: string; deep?: boolean; years?: number }) => {
-				const deep = params.deep ?? options.deepDefault;
-				const years = params.years ?? (deep ? options.yearsDefault : 2);
-				const result = deep ? await fetchUserDeep(params.username, years) : await fetchUser(params.username);
+			execute: async (params: { username: string; years?: number }) => {
+				const years = params.years ?? options.yearsDefault;
+				const key = `${params.username}:${years}`;
+				const result = fetchCache.get(key) ?? await fetchUserDeep(params.username, years);
+				fetchCache.set(key, result);
 				const enriched = await enrichWithThreadContext(result, 50);
 				const deletedPosts = enriched.posts.filter((p) => p.is_deleted || p.is_removed);
 				const deletedComments = enriched.comments.filter((c) => c.is_deleted || c.is_removed);

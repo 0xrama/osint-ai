@@ -47,7 +47,6 @@ interface ReportDetail {
 
 interface ScanRequest {
 	username?: string;
-	deep?: boolean;
 	web?: boolean;
 	years?: number;
 	json?: boolean;
@@ -65,7 +64,7 @@ interface ScanLog {
 interface ScanJob {
 	id: string;
 	status: "queued" | "running" | "completed" | "failed";
-	options: Required<Pick<ScanRequest, "username" | "deep" | "web" | "years" | "json">> & {
+	options: Required<Pick<ScanRequest, "username" | "web" | "years" | "json">> & {
 		provider: "auto" | Provider;
 		model: string;
 		subjectName: string;
@@ -297,7 +296,6 @@ function normalizeScanRequest(input: ScanRequest): ScanJob["options"] {
 	}
 	return {
 		username,
-		deep: !!input.deep,
 		web: !!input.web,
 		years,
 		json: !!input.json,
@@ -380,7 +378,6 @@ async function runScanJob(job: ScanJob): Promise<void> {
 	try {
 		const result = await runAudit({
 			username: job.options.username,
-			deep: job.options.deep,
 			years: job.options.years,
 			web: job.options.web,
 			dataDir: DATA_DIR,

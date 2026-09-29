@@ -27,7 +27,6 @@ Use it only for authorized investigations, privacy reviews, red-team work, journ
 - It does not bypass Reddit auth, private profiles, deleted unavailable data, or platform access controls.
 - It does not guarantee an identity match. Reports should be treated as leads until manually verified.
 - It does not protect you from legal/ethical misuse. That part is on the operator.
-- The old full-screen TUI still exists, but the normal interface is the CLI.
 
 ## Install
 
@@ -70,26 +69,23 @@ FIRECRAWL_API_URL=https://api.firecrawl.dev/v2
 # prompt for username/options
 bun run src/index.tsx
 
-# quick scan
+# scan (downloads the archive, then runs the multi-agent analysis)
 bun run src/index.tsx spez
 
-# deeper scan over 10 years of Reddit history
-bun run src/index.tsx --deep --years 10 spez
-
-# include web search/scrape enrichment
-bun run src/index.tsx --deep --years 10 --web spez
+# scan 10 years of Reddit history with web search/scrape enrichment
+bun run src/index.tsx --years 10 --web spez
 
 # test a candidate identity as a hypothesis
 bun run src/index.tsx --subject-name "Jane Doe" --web some_username
 
 # write machine-readable findings
-bun run src/index.tsx --deep --json some_username
+bun run src/index.tsx --json some_username
 
 # open the web dashboard
 bun run dashboard
 
 # use Claude Code instead of an OpenAI-compatible API
-bun run src/index.tsx --provider claude-code --deep some_username
+bun run src/index.tsx --provider claude-code some_username
 ```
 
 Reports are written to:
@@ -113,23 +109,9 @@ different port. The dashboard reads existing files from `reports/`, opens
 Markdown/JSON reports, compares identifier overlap between reports, and launches
 new scans through the same backend pipeline as the CLI.
 
-## Modes
+## How a scan runs
 
-**Standard mode** calls Reddit/search tools live and writes one report. Good for a quick first pass.
-
-**Deep mode** downloads local JSONL first, filters the corpus, runs separate agents for identity, location, career/education, behavioral signals, and digital footprint, then synthesizes the final report. Slower, usually better.
-
-## Standalone downloader
-
-Useful if you want the raw archive without running the LLM analysis.
-
-```bash
-bun run src/reddit/download.ts some_username --dir ./data
-bun run src/reddit/download.ts --analyze some_username --format stats
-bun run src/reddit/download.ts --analyze some_username --format llm
-```
-
-Data lands in `data/` as JSONL files.
+Every scan downloads the account's history to local JSONL first (cached in `data/`), filters the corpus, runs separate agents for identity, location, career/education, behavioral signals, and digital footprint, then synthesizes the final report. If the archive download returns nothing, it falls back to a live agent that fetches Reddit history through tools. `--deep` is still accepted but does nothing.
 
 ## Project layout
 
