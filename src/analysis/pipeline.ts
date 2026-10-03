@@ -24,6 +24,12 @@ import { runTwitterPass, twitterAvailable, renderTwitterBlock, renderTwitterCont
 import { extractDirectIdentifiers, renderDirectIdentifiersBlock, renderModelMentionedBlock } from "./extract.ts";
 import { extractStructuredFindings, renderStructuredFindings, validateStructuredFindings, type StructuredFindings } from "./findings.ts";
 import { computeCorroboration, renderCorroborationBlock, maxRisk, type CorroborationResult } from "./corroboration.ts";
+import { estimateUtcOffset, renderTimezoneBlock, renderTimezoneContextForPrompt, type TimezoneEstimate } from "./timezone.ts";
+import { renderSubAgentLeadsDigest } from "./leads-digest.ts";
+import { estimateAges, renderAgeBlock, type AgeEstimate } from "./age.ts";
+import { runExistenceProbes, renderExistenceProbeBlock, renderExistenceProbeContextForPrompt, type ExistenceProbeResult } from "./existence-probe.ts";
+import { runArchivePass, renderArchiveBlock, renderArchiveContextForPrompt, type ArchivePassResult } from "./archive-pass.ts";
+import { buildIdentityGraph, renderIdentityGraphBlock, renderIdentityGraphContextForPrompt, type IdentityGraph } from "./identity-graph.ts";
 import { mergeIdentifiersForDisplay, type IdentifierCollections, type AuditVerdict } from "./evidence.ts";
 import type { DirectIdentifiers } from "./extract.ts";
 import type { Candidate } from "../types.ts";
@@ -353,6 +359,14 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// are the next hop in the alias graph. They feed the ranker even when the
 	// web re-probe below is skipped.
 	let altLeadHandles: string[] = [];
+	// Deterministic age estimates (post-synthesis degree-timeline arithmetic).
+	let ageEstimates: AgeEstimate[] = [];
+	// Deterministic existence probes + Wayback archive pass (web-gated).
+	let existenceProbes: ExistenceProbeResult | undefined;
+	let archivePass: ArchivePassResult | undefined;
+	// Person-level identity graph (built twice: pre-synthesis for namesake
+	// ground truth, post-corpus for the full report block).
+	let identityGraph: IdentityGraph | undefined;
 
 	// ── Deterministic web sweep (run EARLY) ──
 	// Run before analysis so the synthesis/live agent can REASON about the
@@ -510,8 +524,97 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		}
 	}
 
+	// ── Deterministic existence probes + Wayback archive pass (web-gated) ──
+	// Profile-existence probes catch platforms search engines never index;
+	// the CDX archive pass catches pre-rename/defunct profiles (snapshots that
+	// predate the subject's cake day). Both are LEADS — existence ≠ same
+	// person — injected as context and rendered as report blocks. Seeded with
+	// the sweep's top-tier handles (bridge owners first), capped internally.
+	if (web) {
+		const probeSeeds = [...new Set([
+			...(webSweep?.bridgeOwnerHandles ?? []),
+			...rankHandles(
+				webSweep?.identifiers.socialHandles ?? [],
+				username,
+				webSweep?.bridgeEvidence,
+			).filter((r) => r.tier !== "single platform").map((r) => r.handle),
+		])];
+		const subjectCreatedUtc = webSweep?.redditProfile?.createdUtc;
+		try {
+			status(`📡 Username existence probes over ${Math.min(3, probeSeeds.length)} handle(s)...`);
+			existenceProbes = await runExistenceProbes(probeSeeds, {}, (msg) => { status(msg); log(msg); });
+			const hits = existenceProbes.probes.filter((p) => p.outcome === "exists").length;
+			if (hits > 0) log(`[probes] ${hits} profile(s) exist for probed handles.`);
+			const ctx = renderExistenceProbeContextForPrompt(existenceProbes);
+			if (ctx) webContextText = `${webContextText}${ctx}`;
+		} catch (err: any) {
+			log(`[probes] Existence probes failed (continuing): ${err?.message ?? err}`);
+		}
+		try {
+			status(`🕰️ Wayback archive pass over top handle(s)...`);
+			archivePass = await runArchivePass(probeSeeds, { subjectCreatedUtc }, (msg) => { status(msg); log(msg); });
+			if (archivePass.snapshots.length > 0) {
+				log(`[archive] ${archivePass.snapshots.length} archived profile URL(s) found.`);
+				const ctx = renderArchiveContextForPrompt(archivePass, subjectCreatedUtc);
+				if (ctx) webContextText = `${webContextText}${ctx}`;
+			}
+		} catch (err: any) {
+			log(`[archive] Archive pass failed (continuing): ${err?.message ?? err}`);
+		}
+	}
+
+	// ── Identity graph, pre-synthesis build (namesake ground truth) ──
+	// Built from the deterministic passes only (no corpus yet): the synthesis
+	// agent learns which handles fuse into the SUBJECT person and which are
+	// provably separate (namesakes) before it writes Identity Resolution.
+	try {
+		const preGraph = buildIdentityGraph({ username, webSweep, gitHub, twitter });
+		const ctx = renderIdentityGraphContextForPrompt(preGraph, username);
+		if (ctx) {
+			webContextText = `${webContextText}${ctx}`;
+			log(`[graph] Pre-synthesis identity graph: ${preGraph.persons.length} person entit(ies) injected as ground truth.`);
+		}
+	} catch (err: any) {
+		log(`[graph] Pre-synthesis identity graph failed (continuing): ${err?.message ?? err}`);
+	}
+
+	// ── Sub-agent ground-truth injection ──
+	// Compact digest of the deterministic leads (bridge owners, clusters,
+	// emails, GitHub/Twitter leaks) so all three domain sub-agents can connect
+	// corpus evidence to verified anchors — only the synthesis agent saw these
+	// before. Swallowed on failure: the digest is an enhancement, never a gate.
+	let subAgentLeadsText = "";
+	try {
+		subAgentLeadsText = renderSubAgentLeadsDigest({ username, webSweep, gitHub, twitter });
+		if (subAgentLeadsText) {
+			log(`[leads] Injecting deterministic leads digest into all three sub-agents (${subAgentLeadsText.length} chars).`);
+		}
+	} catch (err: any) {
+		log(`[leads] Digest failed (continuing without): ${err?.message ?? err}`);
+	}
+
 	status(`Preparing deep scan for u/${username}...`);
 	const local = await ensureLocalData(username, years, dataDir, log);
+
+	// ── Deterministic posting-time timezone estimate (needs the corpus) ──
+	// Sleep-window fit over created_utc: the UTC offset whose local 01:00–07:00
+	// window holds the least activity. Medium/high-confidence fits are injected
+	// into the agent context as ground truth so the synthesis corroborates
+	// location claims against the clock instead of eyeballing timestamps; the
+	// block itself is always rendered (it carries its own confidence + caveat).
+	let timezone: TimezoneEstimate | null = null;
+	if (local) {
+		const stamps = [...local.posts, ...local.comments]
+			.map((x: any) => Number(x?.created_utc))
+			.filter((t: number) => Number.isFinite(t) && t > 0);
+		timezone = estimateUtcOffset(stamps);
+		if (timezone) {
+			log(`[timezone] Posting-time fit: ${timezone.label} (confidence ${timezone.confidence}, ${timezone.postCount} items).`);
+			if (timezone.confidence !== "low") {
+				webContextText = `${webContextText}\n${renderTimezoneContextForPrompt(timezone)}\n`;
+			}
+		}
+	}
 
 	if (local) {
 		log(`\n🔬 Multi-Agent Deep Analysis: ${local.posts.length} posts + ${local.comments.length} comments\n`);
@@ -521,6 +624,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		}, {
 			web: opts.web,
 			webContextText,
+			subAgentLeadsText,
 			// Ground-truth handles from the deterministic passes feed the relevance
 			// ranker — items mentioning these survive the per-domain cap.
 			knownHandles: [
@@ -594,8 +698,42 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// They ran before analysis so the synthesis/live agent could reason about
 	// their ground-truth leads.
 	if (webSweep) content = `${renderWebSweepBlock(webSweep)}${content}`;
+	if (timezone) content = `${renderTimezoneBlock(timezone)}${content}`;
 	if (gitHub && gitHub.identities.length > 0) content = `${renderGitHubBlock(gitHub)}${content}`;
 	if (twitter) content = `${renderTwitterBlock(twitter)}${content}`;
+	if (existenceProbes) content = `${renderExistenceProbeBlock(existenceProbes)}${content}`;
+	if (archivePass) content = `${renderArchiveBlock(archivePass, webSweep?.redditProfile?.createdUtc)}${content}`;
+
+	// ── Deterministic age estimate (post-synthesis, over the report's own claims) ──
+	// Degree-timeline arithmetic the narrative cannot contradict: parse the
+	// education milestones the report itself claims, apply the enrollment-age
+	// norms as code, and append the computed block. Same `now` drives estimate
+	// and render so the ranges stay internally consistent.
+	try {
+		const ageAsOf = new Date();
+		const claimTexts = [
+			content,
+			...(structured?.findings ?? []).map((f) => `${f.claim} ${f.rationale}`),
+		];
+		ageEstimates = estimateAges(claimTexts, ageAsOf);
+		if (ageEstimates.length > 0) {
+			const block = renderAgeBlock(ageEstimates, ageAsOf);
+			content = `${content}\n\n---\n${block}`;
+			log(`[age] ${ageEstimates.length} deterministic estimate(s); tightest age range ${ageEstimates[0].ageRange.join("-")}.`);
+		}
+	} catch (err: any) {
+		log(`[age] Deterministic age pass failed (continuing): ${err?.message ?? err}`);
+	}
+
+	// Raw pre-filter item texts shared by corroboration + the identity graph:
+	// a verbatim word-boundary handle mention on Reddit is a reddit-domain
+	// source for that handle's cluster and a disclosure edge in the graph.
+	const corpusItems = local
+		? [
+			...local.posts.map((p: any) => ({ text: `${p?.title ?? ""} ${p?.selftext ?? ""}`.trim(), permalink: p?.permalink })),
+			...local.comments.map((c: any) => ({ text: c?.body ?? "", permalink: c?.permalink })),
+		]
+		: undefined;
 
 	// ── Cross-signal corroboration (deterministic fusion over ALL sources) ──
 	// Runs last. Crucially it receives the CORPUS-ONLY direct set plus the web
@@ -610,6 +748,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 			webSweep,
 			gitHub,
 			twitter,
+			corpusTexts: corpusItems,
 		});
 		const block = renderCorroborationBlock(corroboration);
 		if (block) content = `${content}\n\n---\n${block}`;
@@ -629,11 +768,37 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		log(`[corroboration] Failed (continuing without corroboration layer): ${err?.message ?? err}`);
 	}
 
+	// ── Identity graph, full build (post-corpus: disclosure edges included) ──
+	// Fuses rename/cluster/drift/disclosure/email/name edges into person
+	// entities: the subject person (handles + emails + names + confidence) and
+	// the namesake candidates the graph says are NOT the subject.
+	try {
+		identityGraph = buildIdentityGraph({
+			username,
+			webSweep,
+			gitHub,
+			twitter,
+			corpusIdentifiers,
+			corpusTexts: corpusItems,
+		});
+		const block = renderIdentityGraphBlock(identityGraph, username);
+		if (block) content = `${content}\n\n---\n${block}`;
+		const subject = identityGraph.persons.find((p) => p.isSubject);
+		log(`[graph] ${identityGraph.persons.length} person entit(ies); subject confidence=${subject?.confidence ?? "n/a"} with ${subject?.handleNodes.length ?? 0} handle(s).`);
+	} catch (err: any) {
+		log(`[graph] Identity graph failed (continuing): ${err?.message ?? err}`);
+	}
+
 	const json = {
 		username,
 		mode: ranDeep ? `deep:${years}yr` : "live-fallback",
 		web,
 		twitter: !!useTwitter,
+		timezone,
+		ageEstimates,
+		existenceProbes,
+		archivePass,
+		identityGraph,
 		candidate: candidate?.name,
 		identifierCollections,
 		directIdentifiers,

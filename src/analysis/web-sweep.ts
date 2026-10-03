@@ -44,7 +44,26 @@ import {
   normalizeHandleKey,
   type DirectIdentifiers,
 } from "./extract.ts";
+import { generateDriftVariants, groupDriftKeys } from "./handle-drift.ts";
 import { followWebsite } from "./site-follower.ts";
+
+/** One stale-cross-reference edge: the page at `url` (owned by the bridge
+ * owner this entry is keyed under) mentions `target` (the old/known handle).
+ * `kind: "anchor-rename"` = the visible link text is the old handle but the
+ * link TARGET (`anchorTarget`) is a different profile root. `confidence` and
+ * `reciprocal` are filled by the sweep's final enrichment pass. */
+export interface BridgeEvidenceEntry {
+  url: string;
+  snippet: string;
+  target?: string;
+  kind?: "anchor-rename";
+  anchorTarget?: string;
+  /** Deterministic 0..1 strength score (see scoreBridgeEntry). */
+  confidence?: number;
+  /** True when the reverse mention edge also exists (A↔B) — a far stronger
+   * same-person signal than a one-way mention. */
+  reciprocal?: boolean;
+}
 
 export interface CandidateProfile {
   url: string;
@@ -82,8 +101,10 @@ export interface WebSweepResult {
    * was mentioned (audited username or a discovered seed). `kind:
    * "anchor-rename"` marks the strongest variant: a link whose VISIBLE TEXT is
    * the old handle but whose TARGET (`anchorTarget`) is a different profile
-   * root — the signature of a renamed handle. */
-  bridgeEvidence?: Record<string, Array<{ url: string; snippet: string; target?: string; kind?: "anchor-rename"; anchorTarget?: string }>>;
+   * root — the signature of a renamed handle. `confidence` (0..1) and
+   * `reciprocal` are attached by the final enrichment pass in
+   * runDeterministicWebSweep so every exported entry carries them. */
+  bridgeEvidence?: Record<string, BridgeEvidenceEntry[]>;
   /** Handles/emails that seeded expansion rounds (the snowball trail). */
   snowballSeeds?: string[];
   /** Bridge owner handles: the CURRENT identity discovered via stale
@@ -110,8 +131,11 @@ export function sweepCapable(): boolean {
   return isFirecrawlConfigured();
 }
 
-/** Fixed battery of platform-targeted queries for the audited username. */
-function buildQueries(username: string): string[] {
+/** Fixed battery of platform-targeted queries for the audited username.
+ * Platform coverage mirrors extract.ts SOCIAL_PATTERNS: every platform the
+ * extractor can read identifiers off must also be SEARCHED here, or a hit on
+ * that platform never fires and the page is never scraped. */
+export function buildQueries(username: string): string[] {
   const q = `"${username}"`;
   const bare = username;
   return [
@@ -121,7 +145,11 @@ function buildQueries(username: string): string[] {
     `site:twitter.com ${q}`,
     `site:instagram.com ${q}`,
     `site:t.me ${q}`,
-    `${bare} github`,
+    `site:youtube.com ${q}`,
+    `site:gitlab.com ${q}`,
+    `site:bsky.app ${q}`,
+    `site:news.ycombinator.com ${q}`,
+    `${bare} github OR youtube OR gitlab OR bluesky`,
     `${bare} infosec OR cybersecurity OR developer`,
     `${q} portfolio OR resume OR cv OR about`,
   ];
@@ -155,6 +183,8 @@ function buildBridgeOwnerQueries(handle: string): string[] {
     `site:linkedin.com/in ${q}`,
     `site:youtube.com ${q}`,
     `site:t.me ${q}`,
+    `site:gitlab.com ${q}`,
+    `site:bsky.app ${q}`,
     `${q} portfolio OR about OR contact OR email`,
     `${handle} github OR twitter OR instagram OR youtube OR linkedin OR telegram OR tiktok`,
   ];
@@ -239,14 +269,102 @@ function extractAnchorBridges(
 const LINK_AGGREGATOR_RE =
   /(^|\.)(linktr\.ee|beacons\.ai|carrd\.co|bio\.link|solo\.to|flow\.page|lnk\.bio|bento\.me|about\.me|allmylinks\.com|hihello\.me)$/i;
 
-/** Big social/dev platforms — scraped via Firecrawl directly (their profile
- * pages render server-side or Firecrawl handles the JS). */
-const BIG_PLATFORM_RE =
-  /(^|\.)(github\.com|x\.com|twitter\.com|instagram\.com|t\.me|linkedin\.com|facebook\.com|youtube\.com)$/i;
+/** Mastodon instance hosts we treat as scrapeable profile platforms. Keep in
+ * sync with the mastodon pattern in extract.ts SOCIAL_PATTERNS — when that
+ * list grows (new instance suffixes or named instances), grow this too. */
+const MASTODON_HOST_RE =
+  /(^|\.)(mastodon\.[a-z.]+|mstdn\.[a-z.]+|fosstodon\.org|hachyderm\.io|infosec\.exchange)$/i;
 
-/** Domains that produce commerce/SEO noise (mirror of profileRootHandle). */
+/** Big social/dev platforms — scraped via Firecrawl directly (their profile
+ * pages render server-side or Firecrawl handles the JS). Mirrors the
+ * extractor's platform set (extract.ts SOCIAL_PATTERNS) so every platform we
+ * can READ identifiers from is also a platform we will SCRAPE. */
+const BIG_PLATFORM_RE =
+  /(^|\.)(github\.com|x\.com|twitter\.com|instagram\.com|t\.me|linkedin\.com|facebook\.com|youtube\.com|gitlab\.com|bsky\.app|stackoverflow\.com|news\.ycombinator\.com|mastodon\.[a-z.]+|mstdn\.[a-z.]+|fosstodon\.org|hachyderm\.io|infosec\.exchange)$/i;
+
+/** Domains that produce commerce/SEO noise (mirror of profileRootHandle).
+ * youtube deliberately NOT here — it is a real profile platform. */
 const NOISE_HOST_RE =
-  /(flipkart|amazon|indiamart|firstsupply|facebook|reddit|steamladder|mudrex|modrinth|coinmarketcap|coingecko|youtube|google|bing|duckduckgo|wikipedia|whatsapp|web\.archive)/;
+  /(flipkart|amazon|indiamart|firstsupply|facebook|reddit|steamladder|mudrex|modrinth|coinmarketcap|coingecko|google|bing|duckduckgo|wikipedia|whatsapp|web\.archive)/;
+
+/**
+ * Deterministic per-entry bridge strength (0..1). Not all bridges weigh the
+ * same: an anchor-rename on the subject's own page says far more than a
+ * one-way mention on a random third-party page. Classification by the URL the
+ * evidence was seen on:
+ *   - anchor-rename (label=old, target=new — direction unambiguous): 1.0
+ *   - page hosted on a link-aggregator (linktr.ee/… — the owner's own
+ *     identity directory): 0.9
+ *   - big-platform profile URL (github.com/<owner> etc. — the owner's own
+ *     identity surface): 0.8
+ *   - anything else (third-party page merely hosting the mention): 0.5
+ * A reciprocal reverse edge (A↔B, see computeReciprocal) adds +0.2, capped at
+ * 1.0. Pure, rounded to 2 decimals.
+ */
+export function scoreBridgeEntry(
+  entry: Pick<BridgeEvidenceEntry, "kind">,
+  ownerUrl: string,
+  reciprocal = false,
+): number {
+  let score: number;
+  if (entry.kind === "anchor-rename") {
+    score = 1.0;
+  } else {
+    let host = "";
+    try { host = new URL(ownerUrl).hostname.toLowerCase(); } catch { host = ""; }
+    if (host && LINK_AGGREGATOR_RE.test(host)) score = 0.9;
+    else if (host && BIG_PLATFORM_RE.test(host)) score = 0.8;
+    else score = 0.5;
+  }
+  if (reciprocal) score = Math.min(1, score + 0.2);
+  return Math.round(score * 100) / 100;
+}
+
+/**
+ * Reciprocity: which bridge edges have a matching reverse edge. An edge
+ * owner→target is reciprocal when some entry (from ANY owner) asserts a
+ * mention between the same two handles in the opposite direction — for
+ * anchor-rename entries the pair is (target ↔ anchorTarget), and the rename
+ * direction itself counts as the reverse assertion (the label literally
+ * points back at the new profile). Returns keys `${ownerLc}->${targetLc}`
+ * (owner lowercased as keyed in the map, target lowercased). Pure; drift/
+ * separator-tolerant via normalizeHandleKey.
+ */
+export function computeReciprocal(
+  bridgeEvidence: Record<string, BridgeEvidenceEntry[]>,
+): Set<string> {
+  // Directed normalized edge set: every entry contributes owner→target, and
+  // anchor-rename entries additionally contribute target→anchorTarget (the
+  // rename direction: the OLD label points AT the NEW profile).
+  const edges = new Set<string>();
+  for (const [owner, entries = []] of Object.entries(bridgeEvidence)) {
+    const o = normalizeHandleKey(owner);
+    for (const e of entries) {
+      const t = normalizeHandleKey(e.target ?? "");
+      if (o && t && o !== t) edges.add(`${o}->${t}`);
+      if (e.kind === "anchor-rename" && e.anchorTarget) {
+        const a = normalizeHandleKey(e.anchorTarget);
+        if (t && a && t !== a) edges.add(`${t}->${a}`);
+      }
+    }
+  }
+  const out = new Set<string>();
+  for (const [owner, entries = []] of Object.entries(bridgeEvidence)) {
+    const o = normalizeHandleKey(owner);
+    for (const e of entries) {
+      const t = normalizeHandleKey(e.target ?? "");
+      if (!o || !t || o === t) continue;
+      // Anchor-rename: the pair is (target ↔ anchorTarget) — and the rename
+      // direction itself asserts the reverse (the old label points AT the new
+      // profile), so these are reciprocal whenever t→anchorTarget exists.
+      const a = e.kind === "anchor-rename" && e.anchorTarget ? normalizeHandleKey(e.anchorTarget) : "";
+      if ((a && edges.has(`${t}->${a}`)) || edges.has(`${t}->${o}`)) {
+        out.add(`${owner}->${(e.target ?? "").toLowerCase()}`);
+      }
+    }
+  }
+  return out;
+}
 
 /** Free-mail providers — a gmail.com domain tells us nothing to follow, but a
  * CUSTOM domain in an email is a site the person owns: chase it. */
@@ -296,7 +414,7 @@ function isVendorEmail(email: string): boolean {
  * link to random unrelated accounts and flood the extractor with false
  * positives. A profile root is github.com/<user>, x.com/<user>, etc.
  */
-function profileRootHandle(url: string): string | null {
+export function profileRootHandle(url: string): string | null {
   let u: URL;
   try { u = new URL(url); } catch { return null; }
   const host = u.hostname.toLowerCase();
@@ -325,6 +443,31 @@ function profileRootHandle(url: string): string | null {
   }
   // linkedin.com/in/<user>
   if (/linkedin\.com$/.test(host) && seg.length === 2 && seg[0].toLowerCase() === "in") return seg[1];
+  // youtube.com/@handle, /channel/UC…, /c/name, /user/name — ONLY those exact
+  // profile-root shapes (NOT /watch, /shorts, /results, /playlist, /feed,
+  // /post, /live, or 2-segment content paths like /@handle/videos)
+  if (/youtube\.com$/.test(host)) {
+    if (seg.length === 1 && seg[0].startsWith("@")) return seg[0].slice(1);
+    if (seg.length === 2 && /^channel$/i.test(seg[0]) && /^UC/i.test(seg[1])) return seg[1];
+    if (seg.length === 2 && /^(c|user)$/i.test(seg[0])) return seg[1];
+  }
+  // gitlab.com/<user>  (NOT /explore, /help, /users, /projects, …)
+  if (/gitlab\.com$/.test(host) && seg.length === 1) {
+    const h = seg[0];
+    if (!/^(explore|help|users|projects|search|public|dashboard|admin|signin|register|about)$/i.test(h)) return h;
+  }
+  // bsky.app/profile/<handle> — the handle may be dotted or a did:plc
+  if (/bsky\.app$/.test(host) && seg.length === 2 && seg[0].toLowerCase() === "profile") return seg[1];
+  // news.ycombinator.com/user?id=<handle>
+  if (/news\.ycombinator\.com$/.test(host) && seg.length === 1 && seg[0].toLowerCase() === "user") {
+    const id = u.searchParams.get("id");
+    if (id) return id;
+  }
+  // stackoverflow.com/users/<id>[/<slug>] — the numeric id is the stable owner
+  // key (the display slug is not); everything else is plumbing
+  if (/stackoverflow\.com$/.test(host) && seg.length >= 2 && seg[0].toLowerCase() === "users" && /^\d+$/.test(seg[1])) return seg[1];
+  // Mastodon instances: <instance>/@handle (single @-segment only)
+  if (MASTODON_HOST_RE.test(host) && seg.length === 1 && seg[0].startsWith("@")) return seg[0].slice(1);
   // Link aggregators: linktr.ee/<user>, beacons.ai/<user>, … — an identity
   // directory page; the path segment IS an owner handle for bridge edges.
   if (LINK_AGGREGATOR_RE.test(host)) {
@@ -340,7 +483,7 @@ function profileRootHandle(url: string): string | null {
   return null;
 }
 
-function worthScraping(url: string): boolean {
+export function worthScraping(url: string): boolean {
   return profileRootHandle(url) !== null;
 }
 
@@ -632,7 +775,7 @@ export async function runDeterministicWebSweep(
 
   /** Pages whose scrape failed get consumed silently; chase items also live in
    * the candidate list at the end (candidateMap + chaseQueue, both kept). */
-  const bridgeEvidence = new Map<string, Array<{ url: string; snippet: string; target?: string; kind?: "anchor-rename"; anchorTarget?: string }>>();
+  const bridgeEvidence = new Map<string, Array<BridgeEvidenceEntry>>();
 
   // ── Round 1: the audited username ──
   const round1 = buildQueries(username);
@@ -709,6 +852,35 @@ export async function runDeterministicWebSweep(
       }
     }
 
+    // ── DRIFT-VARIANT SEARCH SEEDS: people re-spell their own handle with
+    // confusable digits where the letter form was taken (fixtureveil →
+    // fixtureve1l on X). Deterministically query the drifted spellings of the
+    // TOP-TIER handles (bridge owners + bridge/cluster-tier seeds, capped at
+    // 2 handles × 4 variants) so drift-registered profiles surface every run
+    // instead of depending on the LLM trying spellings. Same hygiene as every
+    // other seed: reserved words, sub-3-char keys, sub-4-char spellings, and
+    // already-seeded keys are refused; the audited username's key is in
+    // seededHandles from round 1, so it can never re-enter as a "variant".
+    const driftSeedHandles = [...bridgeOwnerSeeds, ...midRanked
+      .filter((r) => r.tier === "bridge" || r.tier === "cross-platform cluster")
+      .filter((r) => !isSeededHandleWord(r.handle))
+      .map((r) => r.handle),
+    ].filter((h, i, arr) => arr.indexOf(h) === i).slice(0, 2);
+    const driftSeeds: string[] = [];
+    for (const h of driftSeedHandles) {
+      const baseKey = normalizeHandleKey(h);
+      let perHandle = 0;
+      for (const variant of generateDriftVariants(h)) {
+        if (perHandle >= 4) break;
+        const vk = normalizeHandleKey(variant);
+        if (vk === baseKey || variant.length < 4) continue;
+        if (isSeededHandleWord(variant) || seededHandles.has(vk)) continue;
+        driftSeeds.push(variant);
+        seededHandles.add(vk);
+        perHandle++;
+      }
+    }
+
     // Fire bridge-owner searches FIRST (highest priority — current identity).
     if (bridgeOwnerSeeds.length > 0) {
       onProgress?.(
@@ -722,10 +894,10 @@ export async function runDeterministicWebSweep(
       if (fresh > 0) onProgress?.(`[web-sweep] Bridge-owner search found ${fresh} new candidate(s).`);
     }
 
-    if (newHandleSeeds.length > 0 || emailSeeds.length > 0 || bridgeOwnerSeeds.length > 0) {
-      snowballSeeds.push(...newHandleSeeds, ...emailSeeds);
+    if (newHandleSeeds.length > 0 || emailSeeds.length > 0 || bridgeOwnerSeeds.length > 0 || driftSeeds.length > 0) {
+      snowballSeeds.push(...newHandleSeeds, ...emailSeeds, ...driftSeeds);
       onProgress?.(
-        `[web-sweep] Round 2 (snowball): ${bridgeOwnerSeeds.length} bridge-owner(s) + ${newHandleSeeds.length} handle seed(s) [${newHandleSeeds.join(", ")}]${emailSeeds.length > 0 ? ` + ${emailSeeds.length} email seed(s)` : ""}...`,
+        `[web-sweep] Round 2 (snowball): ${bridgeOwnerSeeds.length} bridge-owner(s) + ${newHandleSeeds.length} handle seed(s) [${newHandleSeeds.join(", ")}]${emailSeeds.length > 0 ? ` + ${emailSeeds.length} email seed(s)` : ""}${driftSeeds.length > 0 ? ` + ${driftSeeds.length} drift-variant seed(s) [${driftSeeds.join(", ")}]` : ""}...`,
       );
       const before = new Set(candidateMap.keys());
       for (const seed of newHandleSeeds) {
@@ -733,6 +905,12 @@ export async function runDeterministicWebSweep(
       }
       for (const email of emailSeeds) {
         await runSearchRound(email, buildSeedQueries(email, "email"));
+      }
+      // Drift-variant queries flow through runSearchRound like any other
+      // seed — no extra scrape budget, they only add candidates + mention
+      // targets (finalKnown below picks them up via snowballSeeds).
+      for (const seed of driftSeeds) {
+        await runSearchRound(seed, buildSeedQueries(seed, "handle"));
       }
       const fresh = [...candidateMap.keys()].filter((k) => !before.has(k)).length;
       if (fresh > 0) onProgress?.(`[web-sweep] Snowball found ${fresh} new candidate(s).`);
@@ -796,6 +974,20 @@ export async function runDeterministicWebSweep(
         entry.push({ url: c.url, snippet: ab.snippet, target: ab.target, kind: "anchor-rename", anchorTarget: ab.anchorTarget });
       }
       bridgeEvidence.set(key, entry);
+    }
+  }
+
+  // ── Bridge enrichment: confidence + reciprocity over the FINAL map ──
+  // The map is fully known only here (entries created at scrape time and in
+  // the final pass above), so every exported entry gets its deterministic
+  // strength score and reciprocal marker now — no downstream consumer has to
+  // re-derive them.
+  const reciprocalKeys = computeReciprocal(Object.fromEntries(bridgeEvidence));
+  for (const [owner, entries] of bridgeEvidence) {
+    for (const e of entries) {
+      const rec = !!e.target && reciprocalKeys.has(`${owner}->${e.target.toLowerCase()}`);
+      e.reciprocal = rec;
+      e.confidence = scoreBridgeEntry(e, e.url, rec);
     }
   }
 
@@ -881,8 +1073,14 @@ function attributeSources(
  */
 export interface RankedHandle {
   handle: string;
-  /** all spelling variants seen (separator drift: john.doe / john_doe / johndoe) */
+  /** all spelling variants seen (separator drift: john.doe / john_doe / johndoe,
+   * plus digit/letter drift merged in from sibling clusters: fixtureveil /
+   * fixtureve1l) */
   variants: string[];
+  /** digit/letter drift spellings merged into this cluster from other
+   * separator-normalized buckets (empty when none were merged) — the sweep's
+   * round-2 seeding uses these as query seeds. */
+  driftVariants?: string[];
   platforms: string[];
   urls: string[];
   /** number of distinct platforms this handle string appears on */
@@ -894,8 +1092,12 @@ export interface RankedHandle {
   bridge: boolean;
   /** evidence snippets for the bridge signal, if any. `kind: "anchor-rename"`
    * entries are the strongest variant: the visible link text is the old handle
-   * but the link TARGET (`anchorTarget`) is a different profile. */
-  bridgeEvidence?: Array<{ url: string; snippet: string; target?: string; kind?: "anchor-rename"; anchorTarget?: string }>;
+   * but the link TARGET (`anchorTarget`) is a different profile. Entries from
+   * an enriched sweep carry `confidence`/`reciprocal`. */
+  bridgeEvidence?: BridgeEvidenceEntry[];
+  /** max confidence across this handle's evidence entries (0..1) — bridges
+   * sort by it within the bridge tier (strongest first). */
+  bridgeConfidence?: number;
   /** human-readable rank label */
   tier: "bridge" | "cross-platform cluster" | "username match" | "single platform";
 }
@@ -915,7 +1117,7 @@ export interface RankedHandle {
 export function rankHandles(
   handles: DirectIdentifiers["socialHandles"],
   username: string,
-  bridgeEvidence?: Record<string, Array<{ url: string; snippet: string; target?: string }>>,
+  bridgeEvidence?: Record<string, BridgeEvidenceEntry[]>,
 ): RankedHandle[] {
   type Internal = RankedHandle & { rawKeys: string[] };
   const byKey = new Map<string, { ranked: Internal; counts: Map<string, number> }>();
@@ -951,6 +1153,46 @@ export function rankHandles(
     }
   }
 
+  // ── Drift merge: buckets whose normalized keys are digit/letter drift
+  // variants of each other (fixtureveil vs fixtureve1l) are almost always the
+  // SAME person — one identity re-spelled with confusable digits on platforms
+  // where the letter form was taken. groupDriftKeys unions them pairwise
+  // (min-length 5 inside: short handles collide catastrophically — "bo0" vs
+  // "bool"). RESERVED_SEED_WORDS were filtered at bucket time and merging only
+  // ever combines existing buckets, so drift grouping can never resurrect one.
+  for (const group of groupDriftKeys([...byKey.keys()], 5)) {
+    if (group.length < 2) continue;
+    const total = (key: string) =>
+      [...byKey.get(key)!.counts.values()].reduce((a, b) => a + b, 0);
+    // Primary bucket = most-seen spelling; the rest merge into it so the
+    // display handle stays the dominant real-world spelling.
+    const sorted = [...group].sort((a, b) => total(b) - total(a));
+    const primary = byKey.get(sorted[0])!;
+    for (const otherKey of sorted.slice(1)) {
+      const o = byKey.get(otherKey)!;
+      for (const p of o.ranked.platforms) {
+        if (!primary.ranked.platforms.includes(p)) primary.ranked.platforms.push(p);
+      }
+      for (const u of o.ranked.urls) {
+        if (!primary.ranked.urls.includes(u)) primary.ranked.urls.push(u);
+      }
+      for (const v of o.ranked.variants) {
+        if (!primary.ranked.variants.includes(v)) primary.ranked.variants.push(v);
+        // Record the merged spelling as a drift variant (it survived the
+        // separator-normalized split, so it IS a drift spelling of the primary).
+        if (!primary.ranked.driftVariants) primary.ranked.driftVariants = [];
+        if (!primary.ranked.driftVariants.includes(v)) primary.ranked.driftVariants.push(v);
+      }
+      // rawKeys must carry the drift spellings so bridgeEvidence (keyed by
+      // raw lowercase handle) attaches to the MERGED cluster, not the ghost.
+      for (const k of o.ranked.rawKeys) {
+        if (!primary.ranked.rawKeys.includes(k)) primary.ranked.rawKeys.push(k);
+      }
+      for (const [v, c] of o.counts) primary.counts.set(v, (primary.counts.get(v) ?? 0) + c);
+      byKey.delete(otherKey);
+    }
+  }
+
   const auditedNorm = normalizeHandleKey(username);
   const ranked = [...byKey.values()].map((entry): RankedHandle => {
     const r = entry.ranked;
@@ -970,6 +1212,9 @@ export function rankHandles(
     if (ev.length > 0) {
       r.bridge = true;
       r.bridgeEvidence = ev;
+      r.bridgeConfidence = Math.max(
+        ...ev.map((e) => e.confidence ?? scoreBridgeEntry(e, e.url, e.reciprocal ?? false)),
+      );
       r.tier = "bridge";
     } else if (r.platformCount >= 2) {
       r.tier = "cross-platform cluster";
@@ -989,7 +1234,10 @@ export function rankHandles(
     "single platform": 3,
   } as const;
   ranked.sort(
-    (a, b) => tierOrder[a.tier] - tierOrder[b.tier] || b.platformCount - a.platformCount,
+    (a, b) =>
+      tierOrder[a.tier] - tierOrder[b.tier] ||
+      (b.bridgeConfidence ?? 0) - (a.bridgeConfidence ?? 0) ||
+      b.platformCount - a.platformCount,
   );
   return ranked;
 }
@@ -1051,13 +1299,18 @@ export function renderWebSweepBlock(result: WebSweepResult): string {
       if (bridges.length > 0) {
         lines.push(`**🌉 Bridge leads** — a page owned by this handle mentions the audited username \`${result.username}\` (or another discovered handle). This is the signature of a stale cross-reference (renamed handle, old badge, forgotten link) and the strongest attribution lead. The page owner is the subject's **current/active identity** — search this handle on other platforms.`);
         lines.push("");
+        lines.push(`*Confidence scale: anchor-rename 1.0 > own link-aggregator page 0.9 > own platform profile 0.8 > third-party page 0.5; a reciprocal (↔ two-way) mention adds +0.2 (capped at 1.0). Labels: HIGH ≥ 0.9, MEDIUM ≥ 0.6, LOW < 0.6.*`);
+        lines.push("");
         for (const r of bridges) {
-          lines.push(`- **\`${r.handle}\`** (${r.platforms.join(", ")}) — **THIS IS THE CURRENT IDENTITY**. Owner page links back to old handle:`);
+          const confLabel = r.bridgeConfidence !== undefined ? ` [${confidenceLabel(r.bridgeConfidence)} ${r.bridgeConfidence.toFixed(2)}]` : "";
+          lines.push(`- **\`${r.handle}\`** (${r.platforms.join(", ")})${confLabel} — **THIS IS THE CURRENT IDENTITY**. Owner page links back to old handle:`);
           for (const ev of r.bridgeEvidence!.slice(0, 2)) {
+            const evConf = ev.confidence !== undefined ? ` [${confidenceLabel(ev.confidence)} ${ev.confidence.toFixed(2)}]` : "";
+            const rec = ev.reciprocal ? " ↔ reciprocal" : "";
             if (ev.kind === "anchor-rename") {
-              lines.push(`  - [${ev.url}](${ev.url}) — **anchor-rename**: visible link text is \`${ev.target ?? result.username}\` but the link target is \`${ev.anchorTarget}\` — the handle was renamed — _"${ev.snippet}"_`);
+              lines.push(`  - [${ev.url}](${ev.url}) — **anchor-rename**${evConf}${rec}: visible link text is \`${ev.target ?? result.username}\` but the link target is \`${ev.anchorTarget}\` — the handle was renamed — _"${ev.snippet}"_`);
             } else {
-              lines.push(`  - [${ev.url}](${ev.url}) mentions old handle \`${ev.target ?? result.username}\` — _"${ev.snippet}"_`);
+              lines.push(`  - [${ev.url}](${ev.url}) mentions old handle \`${ev.target ?? result.username}\`${evConf}${rec} — _"${ev.snippet}"_`);
             }
           }
         }
@@ -1082,6 +1335,13 @@ export function renderWebSweepBlock(result: WebSweepResult): string {
   }
 
   return lines.join("\n");
+}
+
+/** Confidence band for display: HIGH ≥ 0.9, MEDIUM ≥ 0.6, LOW < 0.6. */
+function confidenceLabel(confidence: number): "HIGH" | "MEDIUM" | "LOW" {
+  if (confidence >= 0.9) return "HIGH";
+  if (confidence >= 0.6) return "MEDIUM";
+  return "LOW";
 }
 
 /** Short display form for a URL (host + first path segment). */
@@ -1136,11 +1396,15 @@ export function renderWebContextForPrompt(result: WebSweepResult): string {
     lines.push("BRIDGE LEADS (HIGHEST PRIORITY) — a page owned by this handle mentions the audited username or another discovered handle. This is the signature of a stale cross-reference (renamed handle, old badge, forgotten link). The PAGE OWNER is likely the subject’s CURRENT/NEW identity — the handle they switched to after renaming. The handle mentioned (the audited username) is the OLD/STALE one. An ANCHOR-RENAME bridge (a link whose visible text is the old handle but whose target is a different profile) is the strongest form — its direction is unambiguous.");
     lines.push("");
     lines.push("KEY INFERENCE: When you see github.com/fixturenew mentioning fixtureveil, it means fixtureveil RENAMED to fixturenew. Search for the NEW handle (fixturenew) on Instagram, YouTube, Twitter, LinkedIn, etc. — that is where their active profiles will be.");
+    lines.push("CONFIDENCE: each bridge carries a deterministic score — anchor-rename 1.0 > own link-aggregator page 0.9 > own platform profile 0.8 > third-party page 0.5, +0.2 for a reciprocal (↔) two-way mention, capped at 1.0. RECIPROCAL and ANCHOR-RENAME bridges are the strongest attribution signals; LOW-confidence one-way third-party mentions may be ambient (a namesake mention) — verify before treating them as rename evidence.");
     lines.push("");
     for (const r of bridges) {
-      lines.push(`- **${r.handle}** (${r.platforms.join(", ")}) — THIS IS THE CURRENT IDENTITY. Search for \`${r.handle}\` on other platforms.`);
+      const confLabel = r.bridgeConfidence !== undefined ? ` [${confidenceLabel(r.bridgeConfidence)} ${r.bridgeConfidence.toFixed(2)}]` : "";
+      lines.push(`- **${r.handle}** (${r.platforms.join(", ")})${confLabel} — THIS IS THE CURRENT IDENTITY. Search for \`${r.handle}\` on other platforms.`);
       for (const ev of r.bridgeEvidence!.slice(0, 2)) {
-        lines.push(`    URL: ${ev.url}`);
+        const evConf = ev.confidence !== undefined ? ` [${confidenceLabel(ev.confidence)} ${ev.confidence.toFixed(2)}]` : "";
+        const rec = ev.reciprocal ? " [↔ RECIPROCAL]" : "";
+        lines.push(`    URL: ${ev.url}${evConf}${rec}`);
         if (ev.kind === "anchor-rename") {
           lines.push(`    ANCHOR-RENAME (strongest signal, unambiguous direction): the visible link text is "${ev.target ?? result.username}" but the link points to @${ev.anchorTarget} — the handle was renamed FROM ${ev.target ?? result.username} TO ${ev.anchorTarget}. Search ${ev.anchorTarget} everywhere.`);
         } else {

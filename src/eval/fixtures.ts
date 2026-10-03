@@ -492,6 +492,52 @@ const FIXTURES: EvalFixture[] = [
       expectedRisk: "low",
     },
   },
+
+  /* ═══════════════════════════════════════════════════════════════════════
+   * 12. NESTED LOCATION EVIDENCE
+   *     GitHub profile says "Uppal, Hyderabad, India" while Reddit says
+   *     "Hyderabad" — the same place at different granularity. These must
+   *     merge into ONE location cluster, not flag a contradiction.
+   * ═══════════════════════════════════════════════════════════════════════ */
+  {
+    id: "nested-location-1",
+    description: "Consistent nested location evidence: GitHub profile location 'Uppal, Hyderabad, India' plus a Reddit location finding claiming 'Hyderabad'. Nested containment must merge them into one corroborated cluster with no contradiction or risk downgrade.",
+    version: 1,
+    categories: ["nested-location"],
+    inputs: {
+      username: "hyd_resident",
+      searchResults: {
+        '"hyd_resident" github': [
+          searchHit('"hyd_resident" github', "hyd-dev", "https://github.com/hyd-dev",
+            "hyd-dev — hyd_resident on GitHub; based in Uppal, Hyderabad, India"),
+        ],
+      },
+      scrapedPages: {
+        "https://github.com/hyd-dev": scrapePage("https://github.com/hyd-dev",
+          "## hyd-dev\nDeveloper based in Uppal, Hyderabad, India.\n"),
+      },
+      githubProfiles: {
+        "hyd-dev": ghUser("hyd-dev", { name: "Hyd Dev", location: "Uppal, Hyderabad, India" }),
+      },
+      githubCommits: {},
+      redditHistory: [
+        { body: "I'm from Hyderabad, anyone else here?", title: "", permalink: "/r/hyderabad/comments/n1/title/", subreddit: "hyderabad", created_utc: 1700000000 },
+      ],
+      findings: [
+        { category: "location", claim: "Hyderabad", confidence: "medium", evidence: [{ quote: "I'm from Hyderabad", permalink: "/r/hyderabad/comments/n1/title/" }] },
+      ],
+    },
+    groundTruth: {
+      identifiers: {
+        emails: [],
+        handles: [{ platform: "github", handle: "hyd-dev" }],
+      },
+      bridgeEdges: [],
+      nonIdentifiers: { emails: [], handles: [] },
+      subjectLocation: "Hyderabad",
+      expectedRisk: "medium",
+    },
+  },
 ];
 
 export { FIXTURES };

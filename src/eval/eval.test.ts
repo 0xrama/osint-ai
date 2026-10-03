@@ -123,10 +123,10 @@ describe("eval suite: per-category acceptance gates", () => {
 });
 
 describe("eval suite: full regression sweep", () => {
-  test("all 11 fixtures pass without errors", async () => {
+  test("all 12 fixtures pass without errors", async () => {
     const ag = await runEvalSuite(FIXTURES);
     expect(ag.failures).toEqual([]);
-    expect(ag.fixtureCount).toBe(11);
+    expect(ag.fixtureCount).toBe(12);
     // Every category has at least one fixture.
     expect(Object.keys(ag.categoryCoverage).length).toBeGreaterThanOrEqual(9);
   });

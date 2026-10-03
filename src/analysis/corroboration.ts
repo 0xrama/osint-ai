@@ -126,6 +126,13 @@ export interface CorroborationInput {
   webSweep?: WebSweepResult;
   gitHub?: GitHubPassResult;
   twitter?: TwitterPassResult;
+  /** Raw pre-filter Reddit item texts (+ their permalinks). The corpus
+   *  URL-extractor only matches full profile URLs, so a VERBAL handle
+   *  disclosure ("my discord is xyz42", no URL) never becomes an observation.
+   *  We scan these texts for word-boundary mentions of clustered handles and
+   *  credit each mentioning text as one reddit-domain source — a handle the
+   *  subject disclosed on Reddit must not register as web-only. */
+  corpusTexts?: Array<{ text: string; permalink?: string }>;
 }
 
 /** Options for deterministic tests (inject a fixed "now" for age math). */
@@ -378,6 +385,30 @@ function normPermalink(permalink: string): string {
     .toLowerCase();
 }
 
+/**
+ * Word-boundary mention test for a handle spelling in free text — mirrors
+ * web-sweep.ts's extractMentions (not exported, so re-implemented locally).
+ * The preceding-char class excludes URL separators (`/ = & ?`) on TOP of the
+ * word-boundary rule, so a handle inside a path/query fragment
+ * (`/xyz42/i/`, `?id=xyz42`) does NOT count, while `@xyz42`, `[xyz42]`,
+ * `"xyz42"` and bare ` xyz42 ` do. The trailing lookahead rejects run-ons
+ * (`?id=xyz42abc`).
+ */
+function mentionsHandleToken(text: string, handle: string): boolean {
+  const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(^|[^\\w/=&?])(${escaped})(?![\\w])`, "i").test(text);
+}
+
+/** Short verbatim snippet around the first occurrence of `handle` — evidence
+ *  for corpus-mention sources that have no permalink. */
+function mentionSnippet(text: string, handle: string): string {
+  const idx = text.toLowerCase().indexOf(handle.toLowerCase());
+  if (idx < 0) return text.slice(0, 120);
+  const start = Math.max(0, idx - 40);
+  const end = Math.min(text.length, idx + handle.length + 40);
+  return text.slice(start, end).replace(/\s+/g, " ").trim();
+}
+
 function finalizeCluster(acc: ClusterAccumulator): CorroborationCluster {
   const breakdown: SourceBreakdown = {
     reddit_evidence: Math.min(acc.reddit.size, REDDIT_CAP),
@@ -428,6 +459,11 @@ function computeInner(
     sourceId: string;
     /** extra evidence string for the cluster */
     evidence: string;
+    /** REAL platform for handle candidates (e.g. "github", "x", "discord") —
+     *  NOT the pipe it arrived through. Feeds rankHandles so the cluster-tier
+     *  bonus reflects platform diversity; `domain` remains the pipe for the
+     *  source breakdown. */
+    platform?: string;
   };
 
   const candidates: Candidate[] = [];
@@ -476,6 +512,7 @@ function computeInner(
       domain: "direct",
       sourceId: `direct:${h?.platform ?? "?"}:${norm}`,
       evidence: String(h?.url ?? ""),
+      platform: String(h?.platform ?? "?"),
     });
   }
   for (const e of di?.emails ?? []) {
@@ -510,6 +547,7 @@ function computeInner(
         domain: "web",
         sourceId: `web:${m}`,
         evidence: urls[0] ?? "",
+        platform: String(h?.platform ?? "?"),
       });
     }
   }
@@ -587,6 +625,7 @@ function computeInner(
         domain: "github",
         sourceId: `gh:twitter:${login}`,
         evidence: id.url ?? "",
+        platform: "x",
       });
     }
     // The GitHub login itself is a confirmed handle for this account.
@@ -597,6 +636,7 @@ function computeInner(
       domain: "github",
       sourceId: `gh:login:${login}`,
       evidence: id.url ?? "",
+      platform: "github",
     });
     // Commit-author real names: distinct repos = independent git anchors.
     for (const ca of id?.commitAuthors ?? []) {
@@ -630,6 +670,7 @@ function computeInner(
         domain: "twitter",
         sourceId: `tw:profile:${p.screenName.toLowerCase()}`,
         evidence: `https://x.com/${p.screenName}`,
+        platform: "x",
       });
     }
     // Display name → real_name candidate (multi-token names that don't echo
@@ -669,6 +710,7 @@ function computeInner(
         domain: "twitter",
         sourceId: `tw:alt:${alt.profile.screenName.toLowerCase()}`,
         evidence: `https://x.com/${alt.profile.screenName}`,
+        platform: "x",
       });
       const altName = String(alt.profile.name ?? "").trim();
       if (
@@ -769,10 +811,17 @@ function computeInner(
   // Build a merged DirectIdentifiers handle list from all handle candidates,
   // then rank it once; attribute each ranked cluster's sources back by
   // membership on normalizeHandleKey.
+  // Platform de-conflation: `platform` carries the REAL platform (github, x,
+  // discord, …), never the arrival pipe — a handle scraped on github.com via
+  // the web sweep AND read via the GitHub REST API is ONE platform through two
+  // pipes and must not earn the cross-platform cluster bonus. Reddit-domain
+  // handle sources (corpus mentions, disclosure findings) attach to clusters
+  // directly below and are deliberately excluded here so platform diversity
+  // never sees them.
   const ranked = rankHandles(
     candidates
-      .filter((c) => c.signalType === "handle")
-      .map((c) => ({ platform: c.domain, handle: c.display, url: c.evidence || "" })),
+      .filter((c) => c.signalType === "handle" && c.domain !== "reddit")
+      .map((c) => ({ platform: c.platform ?? c.domain, handle: c.display, url: c.evidence || "" })),
     username,
     webSweep?.bridgeEvidence,
   );
@@ -803,6 +852,73 @@ function computeInner(
     }
       if (acc.evidence.length === 0) {
       for (const u of r.urls.slice(0, 3)) acc.evidence.push(u);
+    }
+  }
+
+  /* ── Reddit-side handle disclosures join the identity graph ── */
+  // The corpus URL-extractor only matches full profile URLs, so a VERBAL
+  // disclosure ("my discord is xyz42", no URL) never becomes an observation
+  // and the handle registers as web-only / single-domain. Scan the raw corpus
+  // texts for word-boundary mentions of each clustered handle; each mentioning
+  // text is one reddit-domain source. The audited username never counts (its
+  // cluster is already dropped above), and short norms (< 4 chars) are skipped
+  // so ambient text doesn't fabricate sources.
+  const handleClusterNorms = (): Array<{ acc: ClusterAccumulator; norm: string }> => {
+    const out: Array<{ acc: ClusterAccumulator; norm: string }> = [];
+    for (const acc of clusters.values()) {
+      if (acc.signalType !== "handle") continue;
+      const norm = acc.key.slice("handle:".length);
+      if (norm.length >= 4) out.push({ acc, norm });
+    }
+    return out;
+  };
+
+  const corpusTexts = input.corpusTexts ?? [];
+  if (corpusTexts.length > 0) {
+    for (const { acc, norm } of handleClusterNorms()) {
+      // Raw spelling variants first (separator drift), then the norm — a
+      // corpus saying "john.doe" must match the johndoe cluster via its raw
+      // variant even though the norm never appears verbatim.
+      const spellings = [...acc.rawValues, norm].filter(Boolean);
+      for (let i = 0; i < corpusTexts.length; i++) {
+        const ct = corpusTexts[i];
+        const text = String(ct?.text ?? "");
+        if (!text) continue;
+        const hit = spellings.find((s) => mentionsHandleToken(text, s));
+        if (!hit) continue;
+        const permalink = normPermalink(String(ct?.permalink ?? ""));
+        addToCluster(
+          acc,
+          "reddit",
+          `corpus:${permalink || i}`,
+          permalink || mentionSnippet(text, hit),
+        );
+      }
+    }
+  }
+
+  // cross_platform_handle / external_link findings: the claim text itself
+  // often names a handle the URL-extractor missed. Their evidence permalinks
+  // are corpus-validated upstream (validateStructuredFindings), so each
+  // distinct permalink is one independent reddit-domain source for every
+  // handle cluster the claim mentions.
+  for (const f of findings) {
+    const cat = f?.category;
+    if (cat !== "cross_platform_handle" && cat !== "external_link") continue;
+    const claim = String(f?.claim ?? "");
+    if (!claim) continue;
+    const permalinks = [...new Set(
+      (f?.evidence ?? [])
+        .map((e) => normPermalink(String(e?.permalink ?? "")))
+        .filter(Boolean),
+    )];
+    if (permalinks.length === 0) continue;
+    for (const { acc, norm } of handleClusterNorms()) {
+      const spellings = [...acc.rawValues, norm].filter(Boolean);
+      if (!spellings.some((s) => mentionsHandleToken(claim, s))) continue;
+      for (const p of permalinks) {
+        addToCluster(acc, "reddit", `permalink:${p}`, p);
+      }
     }
   }
 
@@ -1035,6 +1151,22 @@ function computeInner(
 }
 
 /** Containment / token-overlap predicate for fuzzy cluster merging. */
+
+/**
+ * All comma-split location segments, lowercased/trimmed, parentheticals
+ * stripped: "Uppal, Hyderabad, India" → ["uppal", "hyderabad", "india"].
+ * Feeds the nested-location containment merge — a neighborhood/city/state
+ * chain and a bare city inside it are ONE place at different granularity,
+ * not two conflicting locations.
+ */
+function locationSegments(raw: string): string[] {
+  return clean(raw)
+    .replace(/\([^)]*\)/g, " ")
+    .split(",")
+    .map((s) => s.replace(/^the\s+/, "").trim())
+    .filter(Boolean);
+}
+
 function signalValuesOverlap(
   signalType: SignalType,
   existingValue: string,
@@ -1045,7 +1177,19 @@ function signalValuesOverlap(
     case "location": {
       const a = normalizeLocation(existingValue);
       const b = normalizeLocation(newValue);
-      return a === b || a.includes(b) || b.includes(a);
+      if (a === b || a.includes(b) || b.includes(a)) return true;
+      // Nested containment: one side's HEAD (most-specific) segment appearing
+      // anywhere in the other side's FULL segment set means the two describe
+      // the same place at different granularity ("Uppal, Hyderabad, India" vs
+      // "Hyderabad" → merge). Head-to-full only, in either direction — naive
+      // segment intersection would collapse any two cities sharing a country
+      // ("Chennai, India" vs "Hyderabad, India" must stay separate).
+      const segA = locationSegments(existingValue);
+      const segB = locationSegments(newValue);
+      const headA = segA[0] ?? "";
+      const headB = segB[0] ?? "";
+      if (!headA || !headB) return false;
+      return segB.includes(headA) || segA.includes(headB);
     }
     case "employer": {
       const a = normalizeEmployer(existingValue);

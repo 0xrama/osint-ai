@@ -39,7 +39,13 @@ import {
   normalizeHandleKey,
   type DirectIdentifiers,
 } from "./extract.ts";
+import { generateDriftVariants, isDriftVariant } from "./handle-drift.ts";
 import { followWebsite } from "./site-follower.ts";
+
+/* Drift machinery now lives in handle-drift.ts (shared with the web sweep's
+ * clustering + snowball seeding); re-exported here so existing imports of
+ * twitter-pass keep working unchanged. */
+export { generateDriftVariants, isDriftVariant } from "./handle-drift.ts";
 
 /* ────────────────────────────────────────────────────────────────────────
  * Types
@@ -363,48 +369,8 @@ export async function fetchTwitterUserTweets(
  * Triage: alt-account ranking over the following list (pure)
  * ──────────────────────────────────────────────────────────────────────── */
 
-/** Letter↔digit confusables for handle drift (fixtureve1l vs fixtureveil). */
-const LETTER_TO_DIGIT: Record<string, string> = {
-  a: "4", b: "8", e: "3", g: "9", i: "1", l: "1", o: "0", s: "5", t: "7", z: "2",
-};
-const DIGIT_TO_LETTER: Record<string, string> = {
-  "0": "o", "1": "l", "2": "z", "3": "e", "4": "a", "5": "s", "7": "t", "8": "b", "9": "g",
-};
-
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/**
- * All digit/letter-drift variants of a handle (bounded Cartesian expansion —
- * handles are short and few chars are confusable, so this stays tiny).
- * `generateDriftVariants("fixtureveil")` includes "fixtureve1l", "fixtur3veil", …
- */
-export function generateDriftVariants(handle: string, maxVariants = 64): string[] {
-  const base = normalizeHandleKey(handle);
-  if (base.length < 2) return [base];
-  const choices: string[][] = [];
-  for (const ch of base) {
-    const set = new Set<string>([ch]);
-    const mapped = LETTER_TO_DIGIT[ch] ?? DIGIT_TO_LETTER[ch];
-    if (mapped) set.add(mapped);
-    choices.push([...set]);
-  }
-  const out = new Set<string>();
-  const recurse = (idx: number, acc: string): void => {
-    if (out.size >= maxVariants) return;
-    if (idx === choices.length) { out.add(acc); return; }
-    for (const c of choices[idx]) recurse(idx + 1, acc + c);
-  };
-  recurse(0, "");
-  return [...out];
-}
-
-/** True when a and b are drift variants of each other (either direction). */
-export function isDriftVariant(a: string, b: string): boolean {
-  const av = generateDriftVariants(a, 32);
-  const bv = generateDriftVariants(b, 32);
-  return av.some((v) => bv.includes(v)) || bv.some((v) => av.includes(v));
 }
 
 /** Classic Levenshtein edit distance (no deps). */

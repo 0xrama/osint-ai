@@ -786,3 +786,140 @@ describe("twitter domain clustering", () => {
     expect(block).toContain("reclaimed");
   });
 });
+
+/* ── Reddit-side handle disclosures (corpusTexts + disclosure findings) ─── */
+
+describe("reddit-side handle disclosures", () => {
+  const mkSweep = () =>
+    mkWebSweep({
+      identifiers: { emails: [], socialHandles: [mkHandle("discord", "nightowl42", "https://discord.com/users/1")] },
+    });
+
+  test("corpus mention of a web-sweep handle adds a reddit source, corroborates, raises confidence", () => {
+    const withCorpus = run({
+      webSweep: mkSweep(),
+      corpusTexts: [{ text: "my discord is nightowl42 btw", permalink: "/r/chat/abc" }],
+    });
+    const h = withCorpus.clusters.find((c) => c.signalType === "handle")!;
+    expect(h).toBeDefined();
+    expect(h.sourceBreakdown.reddit_evidence).toBe(1);
+    expect(h.corroborating).toBe(true);
+    // Same input without corpusTexts: web-only, single domain, low.
+    const without = run({ webSweep: mkSweep() });
+    const h2 = without.clusters.find((c) => c.signalType === "handle")!;
+    expect(h2.sourceBreakdown.reddit_evidence).toBe(0);
+    expect(h2.corroborating).toBe(false);
+    expect(h.confidence).toBe("medium");
+    expect(h2.confidence).toBe("low");
+  });
+
+  test("word-boundary guard: URL-fragment mentions do NOT count; @ and [bracket] do", () => {
+    const fragments = run({
+      webSweep: mkSweep(),
+      corpusTexts: [
+        { text: "see https://example.com/nightowl42/i/x for the thread", permalink: "/r/1" },
+        { text: "vote here ?id=nightowl42 please", permalink: "/r/2" },
+      ],
+    });
+    const hf = fragments.clusters.find((c) => c.signalType === "handle")!;
+    expect(hf.sourceBreakdown.reddit_evidence).toBe(0);
+
+    const visible = run({
+      webSweep: mkSweep(),
+      corpusTexts: [
+        { text: "ping @nightowl42 anytime", permalink: "/r/3" },
+        { text: "the user [nightowl42] posted that", permalink: "/r/4" },
+      ],
+    });
+    const hv = visible.clusters.find((c) => c.signalType === "handle")!;
+    expect(hv.sourceBreakdown.reddit_evidence).toBe(2);
+  });
+
+  test("cross_platform_handle finding whose claim names the handle counts its permalink once", () => {
+    const res = run({
+      webSweep: mkSweep(),
+      structured: mkStructured([
+        mkFinding("cross_platform_handle", "also goes by nightowl42 elsewhere", ["/r/disclosure/1"]),
+      ]),
+    });
+    const h = res.clusters.find((c) => c.signalType === "handle")!;
+    expect(h.sourceBreakdown.reddit_evidence).toBe(1);
+    expect(h.evidence).toContain("/r/disclosure/1");
+  });
+
+  test("audited username mentioned in the corpus never creates or feeds a cluster", () => {
+    const res = run({
+      webSweep: mkSweep(),
+      corpusTexts: [{ text: "target_user and nightowl42 both here", permalink: "/r/5" }],
+    });
+    const handles = res.clusters.filter((c) => c.signalType === "handle");
+    expect(handles.every((h) => h.value !== "target_user")).toBe(true);
+    const h = handles.find((c) => c.value === "nightowl42")!;
+    expect(h.sourceBreakdown.reddit_evidence).toBe(1);
+  });
+});
+
+/* ── Platform vs domain de-conflation in the tier bonus ────────────────── */
+
+describe("platform de-conflation", () => {
+  test("one platform through two pipes (web github.com + GitHub API) → NO cluster tier, domainCount 2", () => {
+    const res = run({
+      webSweep: mkWebSweep({
+        identifiers: { emails: [], socialHandles: [mkHandle("github", "janedoe", "https://github.com/janedoe")] },
+        identifierSources: {
+          emails: {},
+          handles: { "github:janedoe": ["https://github.com/janedoe"] },
+          freemail: {},
+        },
+      }),
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "janedoe" })]),
+    });
+    const h = res.clusters.find((c) => c.signalType === "handle")!;
+    expect(h.tier).toBeUndefined(); // single platform → no tier, no +1 bonus
+    expect(h.domainCount).toBe(2); // but both pipes still show in the breakdown
+    expect(h.sourceBreakdown.web).toBe(2); // platform:github + url
+    expect(h.sourceBreakdown.github).toBe(1);
+  });
+
+  test("genuinely different platforms (web x + GitHub login) still earn the cluster tier", () => {
+    const res = run({
+      webSweep: mkWebSweep({
+        identifiers: { emails: [], socialHandles: [mkHandle("x", "janedoe", "https://x.com/janedoe")] },
+      }),
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "janedoe" })]),
+    });
+    const h = res.clusters.find((c) => c.signalType === "handle")!;
+    expect(h.tier).toBe("cross-platform cluster");
+  });
+});
+
+/* ── Nested location containment ───────────────────────────────────────── */
+
+describe("nested location containment", () => {
+  test("github 'Uppal, Hyderabad, India' + reddit 'Hyderabad' merge into ONE cluster, no contradiction", () => {
+    const res = run({
+      structured: mkStructured([mkFinding("location", "Hyderabad", ["https://reddit.com/r/hyd/1"])]),
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "jane", location: "Uppal, Hyderabad, India" })]),
+    });
+    const locs = res.clusters.filter((c) => c.signalType === "location");
+    expect(locs.length).toBe(1);
+    // The most specific surface form wins the display value.
+    expect(locs[0].value).toBe("Uppal, Hyderabad, India");
+    expect(locs[0].domainCount).toBe(2);
+    expect(locs[0].corroborating).toBe(true);
+    expect(res.contradictions).toEqual([]);
+    // No risk downgrade: one corroborated location cluster → medium.
+    expect(res.overallRisk).toBe("medium");
+  });
+
+  test("'Chennai, India' vs 'Hyderabad, India' still contradict (shared country must not merge)", () => {
+    const res = run({
+      structured: mkStructured([mkFinding("location", "Hyderabad, India", ["https://reddit.com/r/1"])]),
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "jane", location: "Chennai, India" })]),
+    });
+    const locs = res.clusters.filter((c) => c.signalType === "location");
+    expect(locs.length).toBe(2);
+    expect(res.contradictions.some((c) => c.includes("Conflicting locations"))).toBe(true);
+    expect(res.overallRisk).toBe("low"); // two mediums would be medium; the contradiction downgrades
+  });
+});

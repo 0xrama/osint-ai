@@ -847,6 +847,7 @@ async function runSubAgent(
   onProgress?: (msg: string) => void,
   chunkIndex = 1,
   chunkCount = 1,
+  leadsText = "",
 ): Promise<SubAgentResult> {
   const start = Date.now();
   const chunkLabel = chunkCount > 1 ? ` chunk ${chunkIndex}/${chunkCount}` : "";
@@ -867,7 +868,15 @@ async function runSubAgent(
     ``,
   ].join("\n");
 
-  const prompt = `${dataHeader}${formattedItems}\n\n---\nAnalyze the above data for ${domain.label.toLowerCase()} markers. Be exhaustive.`;
+  // Deterministic leads digest (see leads-digest.ts): the same compact
+  // ground-truth block for every domain sub-agent, injected between the data
+  // header and the items so a sub-agent can CONNECT corpus evidence to a
+  // verified lead. Deliberately OUTSIDE the chunking/char-budget math — it is
+  // small and constant for the whole run, so budgeting it would only shrink
+  // every chunk without changing chunk boundaries.
+  const leadsBlock = leadsText.trim() ? `${leadsText.trim()}\n\n` : "";
+
+  const prompt = `${dataHeader}${leadsBlock}${formattedItems}\n\n---\nAnalyze the above data for ${domain.label.toLowerCase()} markers. Be exhaustive.`;
 
   const output = await promptOnce(domain.prompt, prompt, { role: "subagent" });
 
@@ -971,6 +980,7 @@ async function runDomainAgent(
   domain: Domain,
   items: FilteredItem[],
   onProgress?: (msg: string) => void,
+  leadsText = "",
 ): Promise<SubAgentResult> {
   const chunks = splitItemsForAgent(items);
   if (chunks.length === 0) {
@@ -993,7 +1003,7 @@ async function runDomainAgent(
   const chunkResults: SubAgentResult[] = [];
   for (let i = 0; i < chunks.length; i++) {
     chunkResults.push(
-      await runSubAgent(domain, chunks[i], onProgress, i + 1, chunks.length),
+      await runSubAgent(domain, chunks[i], onProgress, i + 1, chunks.length, leadsText),
     );
   }
 
@@ -1148,7 +1158,7 @@ export async function runDeepAnalysis(
   comments: any[],
   candidate?: Candidate,
   onProgress?: (msg: string) => void,
-  options: { web?: boolean; webContextText?: string; knownHandles?: string[] } = {},
+  options: { web?: boolean; webContextText?: string; knownHandles?: string[]; subAgentLeadsText?: string } = {},
 ): Promise<DeepAnalysisResult> {
   const pipelineStart = Date.now();
   const totalRaw = posts.length + comments.length;
@@ -1248,7 +1258,7 @@ export async function runDeepAnalysis(
   const subResults: SubAgentResult[] = await Promise.all(
     DOMAINS.map((domain) => {
       const items = buckets.get(domain.id) ?? [];
-      return runDomainAgent(domain, items, onProgress);
+      return runDomainAgent(domain, items, onProgress, options.subAgentLeadsText ?? "");
     }),
   );
 

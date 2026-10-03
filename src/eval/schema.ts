@@ -35,7 +35,8 @@ export type FixtureCategory =
   | "conflicting-signal"
   | "no-identity"
   | "partial-archive"
-  | "deleted-content";
+  | "deleted-content"
+  | "nested-location";
 
 export const ALL_CATEGORIES: FixtureCategory[] = [
   "bridge",
@@ -49,6 +50,7 @@ export const ALL_CATEGORIES: FixtureCategory[] = [
   "no-identity",
   "partial-archive",
   "deleted-content",
+  "nested-location",
 ];
 
 /* ────────────────────────────────────────────────────────────────────────
