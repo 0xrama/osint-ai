@@ -814,12 +814,13 @@ describe("reddit-side handle disclosures", () => {
     expect(h2.confidence).toBe("low");
   });
 
-  test("word-boundary guard: URL-fragment mentions do NOT count; @ and [bracket] do", () => {
+  test("disclosure guard: URL fragments and plain prose do NOT count; @ and u/ do", () => {
     const fragments = run({
       webSweep: mkSweep(),
       corpusTexts: [
         { text: "see https://example.com/nightowl42/i/x for the thread", permalink: "/r/1" },
         { text: "vote here ?id=nightowl42 please", permalink: "/r/2" },
+        { text: "the user [nightowl42] posted that", permalink: "/r/6" },
       ],
     });
     const hf = fragments.clusters.find((c) => c.signalType === "handle")!;
@@ -829,7 +830,7 @@ describe("reddit-side handle disclosures", () => {
       webSweep: mkSweep(),
       corpusTexts: [
         { text: "ping @nightowl42 anytime", permalink: "/r/3" },
-        { text: "the user [nightowl42] posted that", permalink: "/r/4" },
+        { text: "the user u/nightowl42 posted that", permalink: "/r/4" },
       ],
     });
     const hv = visible.clusters.find((c) => c.signalType === "handle")!;
@@ -848,10 +849,31 @@ describe("reddit-side handle disclosures", () => {
     expect(h.evidence).toContain("https://reddit.com/r/disclosure/1");
   });
 
+  test("a finding's permalink counts only when that corpus item names the handle", () => {
+    const res = run({
+      webSweep: mkSweep(),
+      corpusTexts: [{ text: "just a post about owls at night", permalink: "/r/disclosure/1" }],
+      structured: mkStructured([
+        mkFinding("cross_platform_handle", "also goes by nightowl42 elsewhere", ["/r/disclosure/1"]),
+      ]),
+    });
+    const h = res.clusters.find((c) => c.signalType === "handle")!;
+    expect(h.sourceBreakdown.reddit_evidence).toBe(0);
+
+    const named = run({
+      webSweep: mkSweep(),
+      corpusTexts: [{ text: "ping nightowl42 for the notes", permalink: "/r/disclosure/1" }],
+      structured: mkStructured([
+        mkFinding("cross_platform_handle", "also goes by nightowl42 elsewhere", ["/r/disclosure/1"]),
+      ]),
+    });
+    expect(named.clusters.find((c) => c.signalType === "handle")!.sourceBreakdown.reddit_evidence).toBe(1);
+  });
+
   test("audited username mentioned in the corpus never creates or feeds a cluster", () => {
     const res = run({
       webSweep: mkSweep(),
-      corpusTexts: [{ text: "target_user and nightowl42 both here", permalink: "/r/5" }],
+      corpusTexts: [{ text: "target_user here, my discord is nightowl42", permalink: "/r/5" }],
     });
     const handles = res.clusters.filter((c) => c.signalType === "handle");
     expect(handles.every((h) => h.value !== "target_user")).toBe(true);

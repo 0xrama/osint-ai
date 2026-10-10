@@ -238,6 +238,23 @@ describe("identity graph: corpus disclosures", () => {
     expect(disclosure!.evidence).toContain("https://reddit.com/r/c/comments/1");
   });
 
+  test("a common-word handle in plain prose is NOT a disclosure; with handle context it is", () => {
+    const input = (text: string): IdentityGraphInput => ({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        identifiers: {
+          emails: [],
+          socialHandles: [{ platform: "github", handle: "microsoft", url: "https://github.com/microsoft" }],
+        },
+      }),
+      corpusTexts: [{ text, permalink: "https://reddit.com/r/c/comments/2" }],
+    });
+    const prose = buildIdentityGraph(input("I interned at Microsoft last summer"));
+    expect(prose.edges.filter((e) => e.kind === "disclosure")).toHaveLength(0);
+    const disclosed = buildIdentityGraph(input("my github is microsoft, long story"));
+    expect(edgeBetween(disclosed, "handle:microsoft", "handle:fixtureveil")?.kind).toBe("disclosure");
+  });
+
   test("URL fragments (/handle/i/x) do NOT create disclosure edges", () => {
     const graph = buildIdentityGraph({
       username: "fixtureveil",
@@ -337,5 +354,31 @@ describe("identity graph: empty inputs and determinism", () => {
       corpusTexts: [{ text: "my alt fixturenew", permalink: "https://reddit.com/r/c/1" }],
     };
     expect(buildIdentityGraph(input)).toEqual(buildIdentityGraph(input));
+  });
+});
+
+describe("identity graph: rename strength follows bridge confidence", () => {
+  const graphFor = (url: string, confidence: number) =>
+    buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        bridgeEvidence: {
+          fixturenew: [{ url, snippet: "…fixtureveil…", target: "fixtureveil", confidence, reciprocal: false }],
+        },
+      }),
+    });
+  const subjectHas = (g: ReturnType<typeof buildIdentityGraph>, id: string) =>
+    g.persons.find((p) => p.isSubject)!.handleNodes.includes(id);
+
+  test("a one-way third-party mention (0.5) is recorded but does NOT merge", () => {
+    const g = graphFor("https://someblog.example/post", 0.5);
+    expect(edgeBetween(g, "handle:fixturenew", "handle:fixtureveil")?.strength).toBe(0.5);
+    expect(subjectHas(g, "handle:fixturenew")).toBe(false);
+  });
+
+  test("an own-profile bridge (0.8) merges the owner into the subject", () => {
+    const g = graphFor("https://github.com/fixturenew", 0.8);
+    expect(edgeBetween(g, "handle:fixturenew", "handle:fixtureveil")?.strength).toBe(0.8);
+    expect(subjectHas(g, "handle:fixturenew")).toBe(true);
   });
 });

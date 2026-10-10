@@ -22,7 +22,7 @@ import { runDeterministicWebSweep, renderWebSweepBlock, renderWebContextForPromp
 import { runGitHubPass, mergeGitHubPass, renderGitHubBlock, renderGitHubContextForPrompt, gitHubIdentifiers, type GitHubPassResult } from "./github-pass.ts";
 import { runTwitterPass, twitterAvailable, renderTwitterBlock, renderTwitterContextForPrompt, twitterIdentifiers, type TwitterPassResult } from "./twitter-pass.ts";
 import { extractDirectIdentifiers, renderDirectIdentifiersBlock, renderModelMentionedBlock } from "./extract.ts";
-import { extractStructuredFindings, renderStructuredFindings, validateStructuredFindings, buildCorpusManifest, type StructuredFindings } from "./findings.ts";
+import { extractStructuredFindings, renderStructuredFindings, validateStructuredFindings, buildCorpusManifest, externalLinkUrl, type StructuredFindings } from "./findings.ts";
 import { computeCorroboration, renderCorroborationBlock, checkCandidateHypothesis, renderCandidateHypothesisBlock, maxRisk, type CorroborationResult, type CandidateHypothesisCheck } from "./corroboration.ts";
 import { estimateUtcOffset, renderTimezoneBlock, renderTimezoneContextForPrompt, type TimezoneEstimate } from "./timezone.ts";
 import { renderSubAgentLeadsDigest } from "./leads-digest.ts";
@@ -601,13 +601,13 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	status(`Preparing deep scan for u/${username}...`);
 	const local = await localPromise;
 
-	// Raw pre-filter item texts + regex identifiers from the subject's own posts,
+	// Raw pre-filter item texts (link-post URLs included) + regex identifiers from the subject's own posts,
 	// shared by the GitHub re-probe, both identity-graph builds and corroboration:
 	// a verbatim handle mention on Reddit is a reddit-domain source and a
 	// disclosure edge in the graph.
 	const corpusItems = local
 		? [
-			...local.posts.map((p: any) => ({ text: `${p?.title ?? ""} ${p?.selftext ?? ""}`.trim(), permalink: p?.permalink })),
+			...local.posts.map((p: any) => ({ text: `${p?.title ?? ""} ${p?.selftext ?? ""} ${externalLinkUrl(p ?? {})}`.trim(), permalink: p?.permalink })),
 			...local.comments.map((c: any) => ({ text: c?.body ?? "", permalink: c?.permalink })),
 		]
 		: undefined;
@@ -651,8 +651,13 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// Built from the deterministic passes plus the subject's own posts: the synthesis
 	// agent learns which handles fuse into the SUBJECT person and which are
 	// provably separate (namesakes) before it writes Identity Resolution.
+	// Handles of the subject person: the ranker boosts corpus items that mention
+	// these, so they must be the subject's — not every handle a scraped page carried.
+	let subjectHandles: string[] = [];
 	try {
 		const preGraph = buildIdentityGraph({ username, webSweep, gitHub, twitter, corpusIdentifiers: localIds, corpusTexts: corpusItems });
+		const subjectNodes = new Set(preGraph.persons.find((p) => p.isSubject)?.handleNodes ?? []);
+		subjectHandles = preGraph.nodes.filter((n) => subjectNodes.has(n.id)).map((n) => n.value);
 		const ctx = renderIdentityGraphContextForPrompt(preGraph, username);
 		if (ctx) {
 			webContextText = `${webContextText}${ctx}`;
@@ -708,12 +713,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 			subAgentLeadsText,
 			// Ground-truth handles from the deterministic passes feed the relevance
 			// ranker — items mentioning these survive the per-domain cap.
-			knownHandles: [
-				...(webSweep?.bridgeOwnerHandles ?? []),
-				...(webSweep?.identifiers.socialHandles ?? []).map((h) => h.handle),
-				...(gitHub?.identities ?? []).map((i) => i.login),
-				...altLeadHandles,
-			],
+			knownHandles: [...(webSweep?.bridgeOwnerHandles ?? []), ...subjectHandles],
 		}));
 		for (const [phase, ms] of Object.entries(result.stats.phase_ms)) phaseMs[`deep: ${phase}`] = ms;
 		content = formatDeepAnalysisReport(result);
@@ -788,18 +788,29 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	if (existenceProbes) content = `${renderExistenceProbeBlock(existenceProbes)}${content}`;
 	if (archivePass) content = `${renderArchiveBlock(archivePass, webSweep?.redditProfile?.createdUtc)}${content}`;
 
-	// ── Deterministic age estimate (post-synthesis, over the report's own claims) ──
+	// ── Deterministic age estimate (post-synthesis, over the subject's own texts) ──
 	// Degree-timeline arithmetic the narrative cannot contradict: parse the
-	// education milestones the report itself claims, apply the enrollment-age
-	// norms as code, and append the computed block. Same `now` drives estimate
-	// and render so the ranges stay internally consistent.
+	// education milestones the subject wrote, apply the enrollment-age norms as
+	// code, and append the computed block. Input is the raw Reddit corpus, each
+	// item anchored to its posting year — never the rendered report, whose
+	// namesake bios, repo/snapshot years and agent prose produced milestones
+	// for other people. Validated finding quotes are verbatim corpus substrings,
+	// so they add nothing here. The live-agent path has no corpus (and its
+	// quotes cannot be validated), so it gets no age block rather than one
+	// computed from model prose. Same `now` drives estimate and render.
 	try {
 		const ageAsOf = new Date();
-		const claimTexts = [
-			content,
-			...(structured?.findings ?? []).map((f) => `${f.claim} ${f.rationale}`),
-		];
-		ageEstimates = estimateAges(claimTexts, ageAsOf);
+		const yearOf = (it: any) => {
+			const ts = Number(it?.created_utc);
+			return ts > 0 ? new Date(ts * 1000).getUTCFullYear() : undefined;
+		};
+		const ageTexts = local
+			? [
+				...local.posts.map((p: any) => ({ text: `${p?.title ?? ""} ${p?.selftext ?? ""}`.trim(), postedYear: yearOf(p) })),
+				...local.comments.map((c: any) => ({ text: c?.body ?? "", postedYear: yearOf(c) })),
+			]
+			: [];
+		ageEstimates = estimateAges(ageTexts, ageAsOf);
 		if (ageEstimates.length > 0) {
 			const block = renderAgeBlock(ageEstimates, ageAsOf);
 			content = `${content}\n\n---\n${block}`;

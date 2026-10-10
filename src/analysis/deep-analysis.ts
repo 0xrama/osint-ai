@@ -31,7 +31,7 @@ import type { Candidate, FilteredItem } from "../types.ts";
 import { formatObjectiveContext } from "../prompts.ts";
 import { heuristicFilter } from "./filter.ts";
 import { extractDirectIdentifiers, renderDirectIdentifiersBlock, renderModelMentionedBlock } from "./extract.ts";
-import { extractStructuredFindings, renderStructuredFindings, buildCorpusManifest, validateStructuredFindings, type StructuredFindings } from "./findings.ts";
+import { extractStructuredFindings, renderStructuredFindings, buildCorpusManifest, validateStructuredFindings, externalLinkUrl, type StructuredFindings } from "./findings.ts";
 import type { DirectIdentifiers } from "./extract.ts";
 import type { RedditPost, RedditComment } from "../reddit/fetch.ts";
 import { buildKeywordWeights, rankAndCapBucket, handleKey, maxItemsPerDomain } from "./rank.ts";
@@ -808,7 +808,9 @@ function splitItemsForAgent(items: FilteredItem[]): FilteredItem[][] {
 }
 
 /**
- * Format filtered items for a sub-agent prompt.
+ * Format filtered items for a sub-agent prompt. A link post's external URL is
+ * shown next to its title — a post linking the subject's own GitHub or blog is
+ * often the strongest identifier in the item.
  */
 function formatItemsForAgent(items: FilteredItem[]): string {
   const lines: string[] = [];
@@ -820,8 +822,10 @@ function formatItemsForAgent(items: FilteredItem[]): string {
     const score = item.score !== 0 ? ` (score: ${item.score})` : "";
     const source = item.source ? ` source:${item.source}` : "";
     const permalink = item.permalink ? ` permalink:${item.permalink}` : "";
+    const linkUrl = externalLinkUrl(item);
+    const link = linkUrl ? ` [links to: ${linkUrl}]` : "";
     lines.push(
-      `[id:${itemIdentity(item)} ${date}] r/${item.subreddit}${deleted}${title}${score}${source}${permalink}: ${text}`,
+      `[id:${itemIdentity(item)} ${date}] r/${item.subreddit}${deleted}${title}${link}${score}${source}${permalink}: ${text}`,
     );
   }
   return lines.join("\n");

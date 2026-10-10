@@ -7,7 +7,9 @@
  * CALIBRATION section forces the milestone → enrollment → birth-year chain,
  * but it relies on the model obeying. This module is the bulletproof fix:
  * the same philosophy as `extract.ts` / `timezone.ts` — pure regex + code
- * over the finished report's own claims, no LLM. Education-system norms
+ * over the subject's own posts and comments, no LLM. (Not the rendered
+ * report: it carries namesake bios, repo/snapshot years and agent prose that
+ * manufactured milestones for someone else.) Education-system norms
  * (bachelor starts ~18, master ~21, PhD ~24) live in a tunable constant
  * table, the arithmetic is deterministic, and the rendered
  * "## Deterministic Age Estimate" block is injected as ground truth the
@@ -15,8 +17,9 @@
  *
  * Design notes:
  * - A milestone only counts when an explicit 4-digit year (1990–2035 sanity
- *   window) appears within ±120 chars of it — a "2nd year" claim with no
- *   date anchors nothing.
+ *   window) appears within ±120 chars of it, else the item's posting year
+ *   (a present-tense "2nd year" claim is stated when it was posted). Each
+ *   item is parsed on its own so years never leak across posts.
  * - The yearKind comes from the governing verb ("graduated"/"class of" vs
  *   "started"/"enrolled" vs bare co-occurrence = stated-during).
  * - Age ranges account for birthday timing: someone born in year B is
@@ -71,6 +74,12 @@ export interface EducationMilestone {
   ordinal?: number;
 }
 
+/** One subject-authored text; `postedYear` anchors milestones with no explicit year nearby. */
+export interface AgeText {
+  text: string;
+  postedYear?: number;
+}
+
 /** Result of one age estimate. Pure data, no methods. */
 export interface AgeEstimate {
   birthYearRange: [number, number];
@@ -87,29 +96,39 @@ export interface AgeEstimate {
 
 // ── Degree keyword patterns ────────────────────────────────────────────
 // Tolerant of B.Sc / BSc / B Sc / BSc. spellings. Lookahead (not \b) at
-// the tail so trailing dots ("B.Sc.") don't break the boundary check.
+// the tail so trailing dots ("B.Sc.") don't break the boundary check, and a
+// leading lookbehind (added in DEGREE_TOKENS) so "maybe" never reads as B.E.
+// B.E / B.A collide with the words "be" / "ba", so they only count dotted
+// (B.E., b.a.) or as undotted capitals (BE, BA) via a case-sensitive group.
 
-const DEGREE_TOKENS: Record<EducationProgram, string> = {
+const DEGREE_ALTERNATIVES: Record<EducationProgram, string[]> = {
   bachelor: [
     "b\\s*\\.?\\s*sc(?![a-z0-9])\\.?",
-    "b\\s*\\.?\\s*a(?![a-z0-9])\\.?",
+    "b\\.\\s*a(?![a-z0-9])\\.?",
+    "(?-i:BA)(?![a-z0-9])",
     "b\\s*\\.?\\s*com(?![a-z0-9])\\.?",
     "b\\s*\\.?\\s*b\\s*\\.?\\s*a(?![a-z0-9])\\.?",
     "b\\s*\\.?\\s*tech(?![a-z0-9])\\.?",
-    "b\\s*\\.?\\s*e(?![a-z0-9])\\.?",
+    "b\\.\\s*e(?![a-z0-9])\\.?",
+    "(?-i:BE)(?![a-z0-9])",
     "bachelor(?:'?s)?(?![a-z0-9])",
     "undergrad(?:uate)?(?![a-z0-9])",
     "college(?![a-z0-9])",
-  ].join("|"),
+  ],
   master: [
     "m\\s*\\.?\\s*sc(?![a-z0-9])\\.?",
     "m\\s*\\.?\\s*ba(?![a-z0-9])\\.?",
     "m\\s*\\.?\\s*tech(?![a-z0-9])\\.?",
     "master(?:'?s)?(?![a-z0-9])",
     "postgrad(?:uate)?(?![a-z0-9])",
-  ].join("|"),
-  phd: ["p\\s*\\.?\\s*h\\s*\\.?\\s*d(?![a-z0-9])\\.?", "doctorate(?![a-z0-9])"].join("|"),
+  ],
+  phd: ["p\\s*\\.?\\s*h\\s*\\.?\\s*d(?![a-z0-9])\\.?", "doctorate(?![a-z0-9])"],
 };
+
+/** Per-program alternation (compiled with "gi"), each token word-start anchored. */
+const DEGREE_TOKENS = Object.fromEntries(
+  Object.entries(DEGREE_ALTERNATIVES).map(([program, alts]) => [program, `(?<![a-z0-9])(?:${alts.join("|")})`]),
+) as Record<EducationProgram, string>;
 
 const PROGRAMS: EducationProgram[] = ["bachelor", "master", "phd"];
 
@@ -206,9 +225,19 @@ function ordinalSuffix(n: number): string {
  *
  * Deterministic: output is sorted by year, then milestone string.
  */
-export function parseEducationTimelines(text: string): EducationMilestone[] {
+export function parseEducationTimelines(text: string, postedYear?: number): EducationMilestone[] {
   const out: EducationMilestone[] = [];
   const years = findYears(text);
+  // Explicit nearby year wins (classified by its verb). Else the posting year,
+  // but only for a present-tense statement ("I'm in my 2nd year"): a
+  // past-tense remark ("my 2nd year was rough") dated to the post inflates age.
+  const PRESENT_RE = /\b(i'?m|i am|currently|right now|this (?:year|semester)|am in)\b/i;
+  const anchor = (idx: number): { year: number; yearKind: EducationMilestone["yearKind"] } | null => {
+    const y = nearestYear(years, idx);
+    if (y) return { year: y.year, yearKind: classifyYear(text, y.index) };
+    const sentence = text.slice(Math.max(0, text.lastIndexOf(".", idx) + 1), idx + 40);
+    return postedYear === undefined || !PRESENT_RE.test(sentence) ? null : { year: postedYear, yearKind: "stated-during" };
+  };
 
   // 1. "2nd year" / "second year" / "final year"
   const NTH_RE =
@@ -223,13 +252,12 @@ export function parseEducationTimelines(text: string): EducationMilestone[] {
     else if (m[2] !== undefined) ordinal = ORDINAL_WORDS[m[2].toLowerCase()];
     else ordinal = EDUCATION_NORMS[program].durationMax; // "final year" = nominal last year
     if (ordinal < 1 || ordinal > 10) continue;
-    const y = nearestYear(years, idx);
+    const y = anchor(idx);
     if (!y) continue;
     out.push({
       milestone: `${ordinal}${ordinalSuffix(ordinal)} year ${program}`,
       program,
-      year: y.year,
-      yearKind: classifyYear(text, y.index),
+      ...y,
       snippet: windowSnippet(text, idx),
       ordinal,
     });
@@ -244,13 +272,12 @@ export function parseEducationTimelines(text: string): EducationMilestone[] {
     const semester = parseInt(m[1], 10);
     if (semester < 1 || semester > 12) continue;
     const ordinal = Math.ceil(semester / 2);
-    const y = nearestYear(years, idx);
+    const y = anchor(idx);
     if (!y) continue;
     out.push({
       milestone: `semester ${semester} ${program}`,
       program,
-      year: y.year,
-      yearKind: classifyYear(text, y.index),
+      ...y,
       snippet: windowSnippet(text, idx),
       ordinal,
     });
@@ -264,13 +291,12 @@ export function parseEducationTimelines(text: string): EducationMilestone[] {
     );
     while ((m = re.exec(text)) !== null) {
       const idx = m.index;
-      const y = nearestYear(years, idx);
+      const y = anchor(idx);
       if (!y) continue;
       out.push({
         milestone: `in ${program}`,
         program,
-        year: y.year,
-        yearKind: classifyYear(text, y.index),
+        ...y,
         snippet: windowSnippet(text, idx),
       });
     }
@@ -367,10 +393,10 @@ function bracketRange(qualifier: string | undefined, base: number): [number, num
   return [base + 7, base + 9]; // late
 }
 
-function parseBrackets(text: string, nowYear: number, dateISO: string): AgeEstimate[] {
+/** `seen` (bracket range keys) is shared across a run's texts so each range is reported once. */
+function parseBrackets(text: string, nowYear: number, dateISO: string, seen: Set<string>): AgeEstimate[] {
   const years = findYears(text);
   const out: AgeEstimate[] = [];
-  const seen = new Set<string>();
   const DEC_RE = /\b(?:in (?:my|his|her|their) )?(early |mid(?:dle)? |late )?(twenties|thirties|forties)\b/gi;
   const DIG_RE = /\b(early |mid(?:dle)? |late )(20s|30s|40s)\b/gi;
   for (const re of [DEC_RE, DIG_RE]) {
@@ -428,22 +454,23 @@ function mergeCluster(members: AgeEstimate[]): AgeEstimate {
 }
 
 /**
- * Compute deterministic age estimates from report texts.
+ * Compute deterministic age estimates from the subject's own texts.
  *
  * Why: this is the post-pass that retires the prompt-only AGE INFERENCE
- * CALIBRATION (gotcha #4) — the norms are applied as code over the report's
- * own claims, so the arithmetic cannot drift no matter what the model
+ * CALIBRATION (gotcha #4) — the norms are applied as code over what the
+ * subject wrote, so the arithmetic cannot drift no matter what the model
  * narrated. Education estimates with overlapping birth-year ranges are
  * merged into the tightest intersection (keeping every chain); disagreeing
  * estimates are all kept so the renderer can flag the conflict. Bracket
  * hints never merge with degree-timeline estimates.
  */
-export function estimateAges(texts: string[], now: Date): AgeEstimate[] {
-  const joined = texts.join("\n");
+export function estimateAges(texts: AgeText[], now: Date): AgeEstimate[] {
   const nowYear = now.getUTCFullYear();
   const dateISO = now.toISOString().slice(0, 10);
 
-  const milestones = parseEducationTimelines(joined);
+  const milestones = texts
+    .flatMap((t) => parseEducationTimelines(t.text, t.postedYear))
+    .sort((a, b) => a.year - b.year || (a.milestone < b.milestone ? -1 : a.milestone > b.milestone ? 1 : 0));
   const seen = new Set<string>();
   const edu: AgeEstimate[] = [];
   for (const ms of milestones) {
@@ -472,7 +499,8 @@ export function estimateAges(texts: string[], now: Date): AgeEstimate[] {
   }
   const merged = clusters.map(mergeCluster);
 
-  const brackets = parseBrackets(joined, nowYear, dateISO);
+  const bracketKeys = new Set<string>();
+  const brackets = texts.flatMap((t) => parseBrackets(t.text, nowYear, dateISO, bracketKeys));
   return [...merged, ...brackets].sort(
     (a, b) =>
       a.birthYearRange[0] - b.birthYearRange[0] ||
@@ -502,7 +530,7 @@ export function renderAgeBlock(estimates: AgeEstimate[], now: Date): string {
   const lines: string[] = [];
   lines.push(`## Deterministic Age Estimate`);
   lines.push(
-    `*Deterministic degree-timeline arithmetic over the report's own claims — the narrative cannot contradict this without new evidence.*`,
+    `*Deterministic degree-timeline arithmetic over the subject's own posts and comments — the narrative cannot contradict this without new evidence.*`,
   );
   lines.push("");
   for (const est of estimates) {

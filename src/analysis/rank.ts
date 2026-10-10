@@ -27,7 +27,8 @@
  */
 
 import type { FilteredItem } from "../types.ts";
-import { normalizeHandleKey } from "./extract.ts";
+import { extractEmails, extractSocialHandles, normalizeHandleKey } from "./extract.ts";
+import { mentionsHandle } from "./match.ts";
 
 // ── Scoring weights ───────────────────────────────────────────────────────
 
@@ -64,24 +65,10 @@ export function isExhaustive(): boolean {
   return v === "1" || v === "true" || v === "yes";
 }
 
-// ── Direct-identifier patterns (kept in sync with extract.ts) ─────────────
-
-const SCORE_EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
-const SCORE_HANDLE_RES: RegExp[] = [
-  /https?:\/\/(?:[\w-]+\.)?linkedin\.com\/in\/[A-Za-z0-9_-]+/i,
-  /https?:\/\/(?:www\.|mobile\.)?(?:twitter\.com|x\.com)\/[A-Za-z0-9_]+/i,
-  /https?:\/\/(?:www\.)?github\.com\/[A-Za-z0-9][A-Za-z0-9-]{0,38}/i,
-  /https?:\/\/(?:www\.)?youtube\.com\/(?:@|channel\/|user\/|c\/)[A-Za-z0-9_-]+/i,
-  /https?:\/\/(?:www\.)?instagram\.com\/[A-Za-z0-9_.]+/i,
-  /https?:\/\/(?:www\.)?bsky\.app\/profile\/[A-Za-z0-9_.:-]+/i,
-  /https?:\/\/news\.ycombinator\.com\/user\?id=[A-Za-z0-9_-]+/i,
-  /https?:\/\/(?:www\.)?t\.me\/[A-Za-z0-9_]+/i,
-  /https?:\/\/(?:www\.)?gitlab\.com\/[A-Za-z0-9][A-Za-z0-9_-]+/i,
-  /https?:\/\/stackoverflow\.com\/users\/\d+/i,
-];
+// ── Direct identifiers: the extractor's own email + platform-URL rules ────
 
 function hasDirectIdentifier(text: string): boolean {
-  return SCORE_EMAIL_RE.test(text) || SCORE_HANDLE_RES.some((re) => re.test(text));
+  return extractEmails(text).length > 0 || extractSocialHandles(text).length > 0;
 }
 
 // ── Keyword newsworthiness (IDF-like weighting over the domain's own list) ──
@@ -153,9 +140,13 @@ export function scoreItem(item: FilteredItem, ctx: RankContext): number {
   score += kwScore;
 
   // Known-handle mention (the audited username / ground-truth handles appear
-  // verbatim in the text) — strong cross-reference signal even without a URL.
-  // Length guard >= 4: a 3-char key ("pix") substring-matches half of English.
-  if (ctx.knownHandleKeys.some((k) => k.length >= 4 && text.includes(k))) {
+  // as a token in the text) — strong cross-reference signal even without a
+  // URL. Keys arrive separator-stripped (johndoe), so they are also matched
+  // against the separator-stripped text ("john_doe" → "johndoe"); token
+  // matching keeps "code" out of "barcode". Length guard >= 4: short keys
+  // are ordinary words.
+  const stripped = text.replace(/[._-]+/g, "");
+  if (ctx.knownHandleKeys.some((k) => k.length >= 4 && (mentionsHandle(text, k) || mentionsHandle(stripped, k)))) {
     score += W_DIRECT_IDENTIFIER;
   }
 

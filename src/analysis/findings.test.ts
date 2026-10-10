@@ -34,12 +34,21 @@ const CORPUS_ITEMS = [
 ];
 
 describe("buildCorpusManifest", () => {
-  test("collects texts + normalized permalinks from raw items", () => {
+  test("maps normalized permalinks to their item text", () => {
     const m = buildCorpusManifest(CORPUS_ITEMS);
     expect(m.texts.length).toBe(3);
-    expect(m.permalinks.has("/r/hyderabad/comments/aaa/title")).toBe(true);
-    expect(m.permalinks.has("/r/programming/comments/bbb/title")).toBe(true);
-    expect(m.permalinks.has("/r/askreddit/comments/ccc/til/x/y")).toBe(true);
+    expect(m.items.get("/r/hyderabad/comments/aaa/title")).toContain("Hyderabad");
+    expect(m.items.get("/r/programming/comments/bbb/title")).toContain("github.com/janedoe");
+    expect(m.items.has("/r/askreddit/comments/ccc/til/x/y")).toBe(true);
+  });
+
+  test("an external link-post URL is corpus text; Reddit-hosted media is not", () => {
+    const linkPost = { title: "my weekend project", selftext: "", url: "https://github.com/janedoe", permalink: "/r/rust/comments/eee/proj/" };
+    const media = { title: "pic", selftext: "", url: "https://i.redd.it/abc.png", permalink: "/r/pics/comments/fff/pic/" };
+    const m = buildCorpusManifest([linkPost, media]);
+    const handles = extractDirectIdentifiers(m.texts).socialHandles.map((h) => `${h.platform}:${h.handle}`);
+    expect(handles).toContain("github:janedoe");
+    expect(m.items.get("/r/pics/comments/fff/pic")).not.toContain("redd.it");
   });
 
   test("post bodies (selftext) are scanned and can validate quotes", () => {
@@ -97,6 +106,50 @@ describe("validateStructuredFindings", () => {
     ]);
     const v = validateStructuredFindings(sf, manifest);
     expect(v.findings[0].evidence.length).toBe(1);
+    // rewritten to the matched item so corroboration can find its text
+    expect(v.findings[0].evidence[0].permalink).toBe("https://reddit.com/r/askreddit/comments/ccc/til/x/y");
+  });
+
+  test("a post-permalink citation of a quote in the post validates even when a comment shares the thread", () => {
+    const m = buildCorpusManifest([
+      { title: "Moving", selftext: "Leaving Pune soon", permalink: "/r/pune/comments/ddd/moving/" },
+      { body: "thanks all", permalink: "/r/pune/comments/ddd/moving/c1/" },
+    ]);
+    const v = validateStructuredFindings(mkStructured([
+      mkFinding("location", [{ quote: "Leaving Pune", permalink: "https://www.reddit.com/r/pune/comments/ddd/moving/c1/" }]),
+    ]), m);
+    expect(v.findings[0].evidence[0]?.permalink).toBe("https://reddit.com/r/pune/comments/ddd/moving");
+  });
+
+  test("drops a real quote paired with an unrelated real permalink", () => {
+    const v = validateStructuredFindings(mkStructured([
+      mkFinding("location", [{ quote: "I live in Hyderabad", permalink: "https://reddit.com/r/programming/comments/bbb/title/" }]),
+    ]), manifest);
+    expect(v.findings[0].evidence.length).toBe(0);
+    expect(v.evidenceValidation?.dropped[0]).toContain("quote not in cited item");
+  });
+
+  test("drops a subreddit-only permalink (it would prefix-match every item)", () => {
+    const v = validateStructuredFindings(mkStructured([
+      mkFinding("location", [{ quote: "I live in Hyderabad", permalink: "https://reddit.com/r/hyderabad" }]),
+    ]), manifest);
+    expect(v.findings[0].evidence.length).toBe(0);
+    expect(v.evidenceValidation?.dropped[0]).toContain("permalink not in corpus");
+  });
+
+  test("short quotes are validated against the cited item only", () => {
+    const m = buildCorpusManifest([
+      { body: "I'm 24 and broke", permalink: "/r/a/comments/111/x/" },
+      { body: "nothing here", permalink: "/r/a/comments/222/y/" },
+    ]);
+    const v = validateStructuredFindings(mkStructured([
+      mkFinding("age_or_dob", [
+        { quote: "I'm 24", permalink: "/r/a/comments/111/x/" },
+        { quote: "I'm 24", permalink: "/r/a/comments/222/y/" },
+      ]),
+    ]), m);
+    expect(v.findings[0].evidence.map((e) => e.permalink)).toEqual(["https://reddit.com/r/a/comments/111/x"]);
+    expect(v.evidenceValidation?.unsupported).toBe(1);
   });
 
   test("without a corpus manifest, only malformed-permalink shape checks run (quotes unchecked)", () => {

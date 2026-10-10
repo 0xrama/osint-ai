@@ -116,7 +116,13 @@ highest-value catch.
   never become search seeds or bridge mention targets: a seed named `github`
   matches the word itself on every scraped page and manufactures fake bridges
   wholesale. Enforced by `RESERVED_SEED_WORDS` / `isVendorEmail` /
-  `isSeededHandleWord` in `web-sweep.ts`; weaken only with a regression case.
+  `isSeededHandleWord` in `match.ts`; weaken only with a regression case.
+- **Matching lives in one place** — `match.ts` owns the platform table, seed
+  hygiene, mailbox classes, `nameLooksReal`, and handle-mention detection in
+  two modes: *bridge* (web pages: hyphen-joined tokens, `@h` counts, emails
+  don't) and *disclosure* (the subject's own posts: needs handle-shaped
+  context — `@h`, `u/h`, a URL, a platform word — so "I interned at
+  Microsoft" never links `microsoft`). Never re-implement a matcher.
 - **Drift** — digit/letter variant families (`l`↔`1`, `o`↔`0`, `s`↔`5`, …)
   in `handle-drift.ts`: `fixtureveil` ≈ `fixtureve1l`. Grouped pairwise via
   union-find because the confusable map is not injective (`i` and `l` both
@@ -180,6 +186,7 @@ src/
     config.ts              .env.local loading → runtimeConfig (llm + firecrawl)
     llm.ts                 promptOnce() — routes to the active provider
     agent.ts               runAgentWithTools() — provider-agnostic tool loop
+    concurrency.ts         mapLimit(): bounded concurrency, input-order results
     tools.ts               Tool defs: reddit_search, web_search, web_scrape,
                             web_follow_site
     firecrawl.ts           Our Firecrawl HTTP client (hard timeouts + 1 retry;
@@ -194,6 +201,7 @@ src/
                             digital) + synthesis agent
     filter.ts              Heuristic noise filter
     rank.ts                Relevance scoring + per-domain cap (big-account fix)
+    match.ts               Shared matching: platform table, hygiene, mentions
     extract.ts             Regex emails + 12-platform handles
     web-sweep.ts           Snowball sweep: bridges (+confidence/reciprocity),
                             ranking, provenance
@@ -219,12 +227,12 @@ src/
 
 ### Data flow (the ordering is load-bearing)
 
-`runAudit`: **web sweep FIRST** (ground-truth leads) → GitHub pass (seeded
-with the sweep's ranked handles; Firecrawl-independent) → optional Twitter
-pass (`--twitter`, Firecrawl-independent) → alt-lead loop closure (Twitter
+`runAudit` (the Reddit corpus download starts immediately, in parallel):
+**web sweep FIRST** (ground-truth leads) → GitHub pass ∥ optional Twitter
+pass (both seeded with the sweep's ranked handles; Firecrawl-independent) → alt-lead loop closure (Twitter
 alt-account candidates re-probed through the GitHub pass + a single-round
-re-sweep, merged back into the primary results) → existence probes + Wayback
-archive pass over the top-tier handles → ensure local JSONL via Arctic Shift
+re-sweep, merged back into the primary results) → existence probes ∥ Wayback
+archive pass over the top-tier handles → await the corpus (Arctic Shift JSONL)
 → GitHub re-probe of handles the subject posted on Reddit → pre-synthesis
 identity-graph build over passes + corpus (namesake ground truth) → live
 tool-driven agent as fallback when nothing downloaded → timezone fit over the

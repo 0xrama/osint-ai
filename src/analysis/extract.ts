@@ -9,7 +9,11 @@
  * non-negotiable cross-platform keys for identity resolution.
  *
  * Adapted from the defensive "deanonymizer" reference project's regex pass.
+ * The per-platform profile-URL table lives in match.ts (shared with the
+ * sweep's scrape selection).
  */
+
+import { SOCIAL_PATTERNS } from "./match.ts";
 
 export interface SocialHandle {
   platform: string;
@@ -33,75 +37,6 @@ const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
 export function normalizeHandleKey(handle: string): string {
   return handle.replace(/^@/, "").toLowerCase().replace(/[._-]+/g, "");
 }
-
-const SOCIAL_PATTERNS: Array<{
-  platform: string;
-  pattern: RegExp;
-  reject?: RegExp;
-}> = [
-  {
-    platform: "linkedin",
-    pattern: /(?:https?:\/\/|(?<![\w.@/-]))(?:[\w-]+\.)?linkedin\.com\/in\/([A-Za-z0-9_-]+)/gi,
-  },
-  {
-    platform: "x",
-    pattern:
-      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.|mobile\.)?(?:twitter\.com|x\.com)\/([A-Za-z0-9_]+)(?=\b|\/|$)/gi,
-    reject:
-      /^(home|search|explore|intent|share|hashtag|notifications|messages|settings|i|compose|login|signup|tos|privacy|about)$/i,
-  },
-  {
-    platform: "github",
-    pattern:
-      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})(?=\b|\/|$)/gi,
-    reject:
-      /^(issues|pull|search|trending|marketplace|orgs|topics|collections|notifications|settings|new|features|pricing|enterprise|sponsors|readme|about|contact|login|join|signup|security|nonprofit|customer-stories|events|codespaces|copilot)$/i,
-  },
-  {
-    platform: "youtube",
-    pattern:
-      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?youtube\.com\/(?:@|channel\/|user\/|c\/)([A-Za-z0-9_-]+)/gi,
-  },
-  {
-    platform: "instagram",
-    pattern:
-      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?instagram\.com\/([A-Za-z0-9_.]+)(?=\b|\/|$)/gi,
-    reject: /^(p|reel|tv|accounts|explore|stories|about|developer)$/i,
-  },
-  {
-    platform: "bluesky",
-    pattern: /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?bsky\.app\/profile\/([A-Za-z0-9_.:-]+)/gi,
-  },
-  {
-    platform: "reddit",
-    pattern:
-      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.|old\.)?reddit\.com\/(?:u|user)\/([A-Za-z0-9_-]+)/gi,
-  },
-  {
-    platform: "hackernews",
-    pattern: /(?:https?:\/\/|(?<![\w.@/-]))news\.ycombinator\.com\/user\?id=([A-Za-z0-9_-]+)/gi,
-  },
-  {
-    platform: "telegram",
-    pattern: /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?t\.me\/([A-Za-z0-9_]+)/gi,
-    reject: /^(joinchat|s)$/i,
-  },
-  {
-    platform: "gitlab",
-    pattern:
-      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?gitlab\.com\/([A-Za-z0-9][A-Za-z0-9_-]+)(?=\b|\/|$)/gi,
-    reject: /^(explore|help|users|projects|search|public|dashboard|admin)$/i,
-  },
-  {
-    platform: "stackoverflow",
-    pattern: /(?:https?:\/\/|(?<![\w.@/-]))stackoverflow\.com\/users\/(\d+)/gi,
-  },
-  {
-    platform: "mastodon",
-    pattern:
-      /(?:https?:\/\/|(?<![\w.@/-]))(mastodon\.[a-z.]+|mstdn\.[a-z.]+|fosstodon\.org|hachyderm\.io|infosec\.exchange)\/@([A-Za-z0-9_]+)/gi,
-  },
-];
 
 /** Replace common email obfuscation patterns with the canonical form. */
 export function deobfuscateEmails(input: string): string {

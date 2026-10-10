@@ -13,7 +13,8 @@
  *   - `generateDriftVariants`: the bounded Cartesian set of drifted spellings
  *     (used as round-2 snowball SEARCH seeds, catching drift-registered
  *     profiles on platforms beyond X).
- *   - `isDriftVariant`: pairwise drift test (used to triage follow graphs).
+ *   - `isDriftVariant`: positional pairwise drift test (follow-graph triage,
+ *     identity-graph drift edges, sweep clustering).
  *   - `groupDriftKeys`: families of separator-normalized keys that are drift
  *     variants of each other (min-length guarded), used by the sweep's handle
  *     clustering so `fixtureveil` (GitHub) and `fixtureve1l` (X) merge into
@@ -57,11 +58,36 @@ export function generateDriftVariants(handle: string, maxVariants = 64): string[
   return [...out];
 }
 
-/** True when a and b are drift variants of each other (either direction). */
+/** True when x and y are the same char or a direct letter↔digit confusable pair. */
+function sameOrConfusable(x: string, y: string): boolean {
+  return x === y || LETTER_TO_DIGIT[x] === y || LETTER_TO_DIGIT[y] === x;
+}
+
+/**
+ * True when a and b are drift variants of each other (either direction).
+ *
+ * Position-by-position over the separator-normalized keys rather than
+ * intersecting `generateDriftVariants` sets: the variant expansion is capped,
+ * so in long handles (≥6 confusable chars) early positions were never varied
+ * and `f1xtureveil` failed to match `fixtureveil`. Only direct map pairs count
+ * (`l`↔`1`, not `i`↔`l` via a shared digit) — that would be a letter swap.
+ *
+ * A difference confined to a trailing digit run is NOT drift: `kevinl` vs
+ * `kevin1`, `alex1` vs `alexl` are usually distinct accounts with a numeric
+ * suffix, and a false drift edge merges two people in the identity graph.
+ */
 export function isDriftVariant(a: string, b: string): boolean {
-  const av = generateDriftVariants(a, 32);
-  const bv = generateDriftVariants(b, 32);
-  return av.some((v) => bv.includes(v)) || bv.some((v) => av.includes(v));
+  const ka = normalizeHandleKey(a);
+  const kb = normalizeHandleKey(b);
+  if (ka.length !== kb.length || ka === kb) return ka === kb;
+  let firstDiff = -1;
+  for (let i = 0; i < ka.length; i++) {
+    if (ka[i] === kb[i]) continue;
+    if (!sameOrConfusable(ka[i], kb[i])) return false;
+    if (firstDiff < 0) firstDiff = i;
+  }
+  const trailingDigitsFrom = (k: string): number => k.length - (k.match(/\d*$/)?.[0].length ?? 0);
+  return firstDiff < Math.min(trailingDigitsFrom(ka), trailingDigitsFrom(kb));
 }
 
 /**

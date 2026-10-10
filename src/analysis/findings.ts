@@ -203,16 +203,17 @@ function coerce(parsed: any): StructuredFindings {
   };
 }
 
-/** The subject's real corpus, for evidence validation. When provided, every
- *  structured-finding quote must appear in `texts` and every permalink must
- *  belong to `permalinks`; otherwise the evidence entry is dropped (it carries
- *  zero weight). Built from the RAW pre-filter Reddit history so identifiers /
- *  quotes in filtered-out items are still recognized. */
+/** The subject's real corpus, for evidence validation. Built from the RAW
+ *  pre-filter Reddit history so identifiers / quotes in filtered-out items are
+ *  still recognized. A cited quote must appear in the text of the cited item —
+ *  never just somewhere in the corpus — so a real quote cannot be paired with
+ *  an unrelated real permalink. */
 export interface CorpusManifest {
-  /** raw item texts (body + title), pre-filter */
+  /** every raw item text (title + body + external link-post URL), pre-filter —
+   *  the input to deterministic identifier extraction */
   texts: string[];
-  /** normalized permalinks that legitimately belong to this subject's corpus */
-  permalinks: Set<string>;
+  /** normalized item permalink → that item's text */
+  items: Map<string, string>;
 }
 
 /** Normalize a permalink for corpus membership comparison: strip scheme +
@@ -221,10 +222,9 @@ export interface CorpusManifest {
 function normalizePermalinkForValidation(p: string): string {
   let s = p.trim();
   try {
-    const u = new URL(s);
-    s = u.pathname + u.search;
+    s = new URL(s).pathname;
   } catch {
-    s = s.replace(/^https?:\/\/[^/]+/i, "");
+    s = s.replace(/^https?:\/\/[^/]+/i, "").replace(/[?#].*$/, "");
   }
   return s.replace(/\/+$/, "").toLowerCase();
 }
@@ -234,40 +234,58 @@ function normalizeForQuote(s: string): string {
   return s.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
-/** True when `candidate` permalink corresponds to a real corpus permalink,
- *  tolerating post-vs-comment depth differences via bidirectional prefixing. */
-function permalinkInCorpus(candidate: string, validPerms: Set<string>): boolean {
+/** An item permalink names a thread (`/comments/<id>`); a bare `/r/sub` would
+ *  prefix-match every item in that subreddit. */
+const ITEM_PERMALINK_RE = /\/comments\/[a-z0-9]+/;
+
+/** Corpus items a cited permalink can refer to: the exact item, or one at a
+ *  different thread depth (a comment permalink is the post permalink + comment
+ *  id, and models drop/add the slug). Matching is on whole path segments. */
+function citedItems(candidate: string, items: Map<string, string>): Array<[string, string]> {
   const c = normalizePermalinkForValidation(candidate);
-  if (!c) return false;
-  if (validPerms.has(c)) return true;
-  for (const v of validPerms) {
-    if (v.startsWith(c) || c.startsWith(v)) return true;
+  if (!ITEM_PERMALINK_RE.test(c)) return [];
+  return [...items]
+    .filter(([k]) => k === c || k.startsWith(`${c}/`) || c.startsWith(`${k}/`))
+    .sort(([a], [b]) => Number(b === c) - Number(a === c)); // exact item first
+}
+
+/** The external URL of a link post (the poster's GitHub, blog, video…), or ""
+ *  for self posts, comments and Reddit-hosted media / crossposts. */
+export function externalLinkUrl(item: { url?: string }): string {
+  const url = String(item.url ?? "").trim();
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return /(^|\.)(reddit\.com|redd\.it|redditmedia\.com)$/.test(host) ? "" : url;
+  } catch {
+    return "";
   }
-  return false;
 }
 
 /** Build a CorpusManifest from raw Reddit posts + comments (pre-filter). */
 export function buildCorpusManifest(
-  items: Array<{ body?: string; title?: string; selftext?: string; permalink?: string }>,
+  items: Array<{ body?: string; title?: string; selftext?: string; url?: string; permalink?: string }>,
 ): CorpusManifest {
   const texts: string[] = [];
-  const permalinks = new Set<string>();
+  const byPermalink = new Map<string, string>();
   for (const it of items) {
     // Posts carry their body in `selftext`, comments in `body`.
-    texts.push(`${it.title ?? ""} ${it.selftext ?? ""} ${it.body ?? ""}`);
-    if (it.permalink) permalinks.add(normalizePermalinkForValidation(it.permalink));
+    const text = `${it.title ?? ""} ${it.selftext ?? ""} ${it.body ?? ""} ${externalLinkUrl(it)}`;
+    texts.push(text);
+    if (it.permalink) byPermalink.set(normalizePermalinkForValidation(it.permalink), text);
   }
-  return { texts, permalinks };
+  return { texts, items: byPermalink };
 }
 
 /**
  * Validate structured-findings evidence against the real corpus.
  *
  * Schema-valid evidence is not necessarily real evidence: a model can emit a
- * plausible-looking quote + permalink that exists nowhere in the source. This
- * drops evidence entries whose permalink is not a corpus permalink or whose
- * quote does not appear in the corpus text, so unsupported evidence carries
- * zero weight downstream (corroboration counts only surviving permalinks).
+ * plausible-looking quote + permalink that exists nowhere in the source, or
+ * pair a real quote with an unrelated real permalink. An entry survives only
+ * when its permalink names a corpus item (`/comments/<id>`, depth-tolerant) and
+ * its quote — any length — appears in THAT item's text. A surviving permalink
+ * is rewritten to the matched item's canonical permalink, so corroboration can
+ * count it once and look up the cited item's text.
  *
  * When no `manifest` is supplied, only URL-shape validation runs: malformed
  * permalinks are dropped but quotes cannot be checked. An EMPTY manifest means
@@ -282,44 +300,37 @@ export function validateStructuredFindings(
   let checked = 0;
   let unsupported = 0;
 
-  const hasCorpus = !!manifest && manifest.permalinks.size > 0;
-  const noCorpusText = !!manifest && manifest.permalinks.size === 0 && manifest.texts.length === 0;
-  const joined = hasCorpus ? normalizeForQuote(manifest!.texts.join("\n\n")) : "";
-  const validPerms = hasCorpus
-    ? new Set([...manifest!.permalinks].map(normalizePermalinkForValidation))
-    : new Set<string>();
+  const hasCorpus = !!manifest && (manifest.items.size > 0 || manifest.texts.length > 0);
+  const reject = (reason: string): never[] => {
+    unsupported++;
+    dropped.push(reason);
+    return [];
+  };
 
   const findings = sf.findings.map((f) => {
-    const evidence = f.evidence.filter((e) => {
+    const evidence = f.evidence.flatMap((e) => {
       checked++;
       const p = (e.permalink ?? "").trim();
-      const q = (e.quote ?? "").trim();
+      const q = normalizeForQuote(e.quote ?? "");
       // Always reject non-URL / non-path permalinks (shape check, every path).
       if (p && !/^https?:\/\//i.test(p) && !p.startsWith("/r/")) {
-        unsupported++;
-        dropped.push(`malformed permalink: ${p.slice(0, 80)}`);
-        return false;
+        return reject(`malformed permalink: ${p.slice(0, 80)}`);
       }
-      if (noCorpusText && (p || q)) {
-        unsupported++;
-        dropped.push(`no corpus text to verify: ${(p || q).slice(0, 80)}`);
-        return false;
+      if (!manifest) return [e]; // cannot check membership without a corpus
+      if (!hasCorpus) {
+        return p || q ? reject(`no corpus text to verify: ${(p || q).slice(0, 80)}`) : [e];
       }
-      if (!hasCorpus) return true; // cannot check membership without a corpus
-      // Permalink must belong to this subject's corpus.
-      if (p && !permalinkInCorpus(p, validPerms)) {
-        unsupported++;
-        dropped.push(`permalink not in corpus: ${p.slice(0, 80)}`);
-        return false;
+      if (!p) {
+        // A bare quote carries no source weight; it only has to be real.
+        return !q || manifest.texts.some((t) => normalizeForQuote(t).includes(q))
+          ? [e]
+          : reject(`quote not in corpus: ${q.slice(0, 60)}`);
       }
-      // Quote must actually appear in the corpus text (skip very short quotes
-      // — too noisy to assert on).
-      if (q && q.length >= 8 && !joined.includes(normalizeForQuote(q))) {
-        unsupported++;
-        dropped.push(`quote not in corpus: ${q.slice(0, 60)}`);
-        return false;
-      }
-      return true;
+      const candidates = citedItems(p, manifest.items);
+      if (candidates.length === 0) return reject(`permalink not in corpus: ${p.slice(0, 80)}`);
+      const hit = candidates.find(([, text]) => !q || normalizeForQuote(text).includes(q));
+      if (!hit) return reject(`quote not in cited item: ${q.slice(0, 60)}`);
+      return [{ ...e, permalink: `https://reddit.com${hit[0]}` }];
     });
     return { ...f, evidence };
   });

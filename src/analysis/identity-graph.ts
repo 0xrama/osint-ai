@@ -51,7 +51,15 @@
 
 import { normalizeHandleKey, type DirectIdentifiers, type SocialHandle } from "./extract.ts";
 import { isDriftVariant } from "./handle-drift.ts";
-import { isRoleMailbox, isSeededHandleWord, rankHandles, type WebSweepResult } from "./web-sweep.ts";
+import { rankHandles, type WebSweepResult } from "./web-sweep.ts";
+import {
+  disclosesHandle,
+  isContentlessEmail,
+  isRoleMailbox,
+  isSeededHandleWord,
+  nameLooksReal,
+  snippetAround,
+} from "./match.ts";
 import type { GitHubPassResult } from "./github-pass.ts";
 import type { TwitterPassResult } from "./twitter-pass.ts";
 
@@ -120,55 +128,8 @@ export interface IdentityGraphInput {
 }
 
 /* ────────────────────────────────────────────────────────────────────────
- * Local mirrors of module-private helpers
- * ──────────────────────────────────────────────────────────────────────── */
-
-/** Mirror of github-pass.ts `isContentlessEmail` — GitHub-generated mailboxes
- * carry no identity and must not become email nodes. */
-function isContentlessEmail(email: string): boolean {
-  return /^((noreply|no-reply|donotreply)@|[^@]{0,2}@)|users\.noreply\.github\.com$/i.test(email);
-}
-
-/**
- * Mirror of twitter-pass.ts `nameLooksReal`: ≥2 alphabetic tokens, at least
- * one capitalized, and not just the handle re-spelled. "Rohan Sharma" yes;
- * "0x crypto whale" no. Used so Twitter display-name edges only fire for
- * names that actually look like a person.
- */
-function looksLikeRealName(name: string, handle: string): boolean {
-  const tokens = name
-    .split(/\s+/)
-    .map((t) => t.replace(/[^A-Za-zÀ-ž'-]/g, ""))
-    .filter((t) => t.length >= 2);
-  if (tokens.length < 2) return false;
-  const stem = normalizeHandleKey(handle);
-  if (tokens.join("").toLowerCase() === stem) return false;
-  return tokens.some((t) => /^[A-ZÀ-Ž]/.test(t));
-}
-
-/* ────────────────────────────────────────────────────────────────────────
  * Small utilities
  * ──────────────────────────────────────────────────────────────────────── */
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-/** Word-boundary token match that rejects URL-fragment false positives
- * (`/handle/i/x`, `?id=handle`): the char before must not be a word char or
- * a URL metachar, and the char after must not be a word char. */
-function mentionsHandleToken(text: string, handle: string): number {
-  const re = new RegExp(`(^|[^\\w/=&?])(${escapeRegExp(handle)})(?![\\w])`, "i");
-  const m = re.exec(text);
-  return m ? m.index + m[1].length : -1;
-}
-
-function snippetAround(text: string, idx: number, len: number, radius = 60): string {
-  const start = Math.max(0, idx - radius);
-  const end = Math.min(text.length, idx + len + radius);
-  const core = text.slice(start, end).replace(/\s+/g, " ").trim();
-  return `${start > 0 ? "…" : ""}${core}${end < text.length ? "…" : ""}`.slice(0, 120);
-}
 
 /** Stable node key for a personal-site URL (protocol/www/trailing-slash stripped). */
 function siteKey(url: string): string | null {
@@ -223,7 +184,8 @@ function profileContradictsCorpus(
   return mismatch;
 }
 
-/* Edge strengths — fixed by edge semantics (see module JSDoc). */
+/* Edge strengths — fixed by edge semantics (see module JSDoc); `rename`
+ * is only the fallback for bridge entries without a sweep confidence. */
 const STRENGTH = {
   rename: 0.7,
   anchorRename: 1.0,
@@ -258,16 +220,19 @@ interface HandleBucket {
  * (no clock, no network, no LLM); nodes/edges/persons are sorted by id.
  *
  * Edge semantics shipped:
- *   - `rename` (0.7): a page owned by handle B mentions the target handle —
- *     the stale-badge bridge. Owner (current identity) → target (stale).
+ *   - `rename` (the bridge entry's sweep confidence, 0.7 when absent): a
+ *     page owned by handle B mentions the target handle — the stale-badge
+ *     bridge. Owner (current identity) → target (stale). A one-way
+ *     third-party mention (0.5) is recorded but never merges persons.
  *   - `anchor-rename` (1.0): the strongest bridge variant — a link whose
  *     visible text is the old handle but whose target is a different profile
  *     root. Direction is unambiguous, so is the strength: link target (new)
  *     → label (old), whoever owns the page.
  *   - `drift` (0.6): two handle nodes whose normalized keys are digit/letter
  *     drift variants (fixtureveil ↔ fixtureve1l), keys ≥5 chars.
- *   - `disclosure` (0.8): the corpus verbally mentions a discovered handle
- *     (word-boundary, URL-fragment-safe) → edge INTO the audited-username
+ *   - `disclosure` (0.8): the corpus discloses a discovered handle in
+ *     handle-shaped context (match.ts disclosesHandle: `@h`, `u/h`, a
+ *     profile URL, a platform word nearby) → edge INTO the audited-username
  *     node, tying the handle to the audited identity.
  *     A corpus-extracted email (non-vendor, non-noreply) gets the same
  *     edge, evidence = the permalinks of the posts containing it.
@@ -479,7 +444,10 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
         // The anchor's label is also a plain mention of the target on the same
         // page; that one observation already produced the anchor edge.
         const anchored = entries.some((a) => a.kind === "anchor-rename" && a.url === e.url && a.target === e.target);
-        if (!anchored) addEdge(owner.id, target.id, "rename", STRENGTH.rename, [e.url]);
+        // Strength = the sweep's per-bridge confidence: a one-way third-party
+        // mention (0.5) stays below the merge line; an own-profile (0.8),
+        // aggregator (0.9) or reciprocal bridge merges.
+        if (!anchored) addEdge(owner.id, target.id, "rename", e.confidence ?? STRENGTH.rename, [e.url]);
       }
     }
   }
@@ -496,8 +464,9 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
   }
 
   // 5c. disclosure: the subject verbally mentioned a discovered handle in
-  // their own corpus → tie it to the audited identity. Word-boundary scan
-  // over every spelling variant; URL fragments (/handle/i/x) never match.
+  // their own corpus → tie it to the audited identity. Every spelling
+  // variant is scanned; plain prose ("I interned at Microsoft") and URL
+  // fragments (/handle/i/x) never count.
   if (input.corpusTexts?.length) {
     for (const [key, node] of handleNodes) {
       if (key === auditedKey || key.length < 4 || isSeededHandleWord(key)) continue;
@@ -505,7 +474,7 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
       const evidence: string[] = [];
       for (const item of input.corpusTexts) {
         for (const variant of variants) {
-          const idx = mentionsHandleToken(item.text, variant);
+          const idx = disclosesHandle(item.text, variant);
           if (idx >= 0) {
             evidence.push(item.permalink ?? snippetAround(item.text, idx, variant.length));
             break;
@@ -571,7 +540,9 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
       addEdge(loginNode.id, ensureEmailNode(e).id, "email-of", STRENGTH.emailOf, [gh.url]);
     }
     const names = new Set(
-      [gh.name ?? "", ...gh.commitAuthors.map((a) => a.name)].filter((s) => s.trim().length > 0),
+      // No-handle mode: a GitHub name field is its own declaration even when
+      // the login was derived from it (same gate as corroboration).
+      [gh.name ?? "", ...gh.commitAuthors.map((a) => a.name)].filter((n) => nameLooksReal(n)),
     );
     for (const n of names) {
       addEdge(loginNode.id, ensureNameNode(n).id, "name-of", STRENGTH.nameOf, [gh.url]);
@@ -590,7 +561,7 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
     const profileUrl = `https://x.com/${p.screenName}`;
     const node = profileNode("x", p.screenName, profileUrl, p, []);
     if (!node) continue;
-    if (p.name && looksLikeRealName(p.name, p.screenName)) {
+    if (p.name && nameLooksReal(p.name, p.screenName)) {
       addEdge(node.id, ensureNameNode(p.name).id, "name-of", STRENGTH.nameOf, [profileUrl]);
     }
     if (p.url) {

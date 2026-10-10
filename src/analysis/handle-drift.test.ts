@@ -37,6 +37,25 @@ describe("handle-drift: isDriftVariant", () => {
     expect(isDriftVariant("j0hnd0e", "johndoe")).toBe(true);
   });
 
+  test("long handles drift at any position (no variant cap)", () => {
+    // 6+ confusable chars: the capped variant expansion never varied the
+    // first positions, so f1xtureveil used to miss fixtureveil.
+    expect(isDriftVariant("f1xtureveil", "fixtureveil")).toBe(true);
+    expect(isDriftVariant("f1x7ur3ve1l", "fixtureveil")).toBe(true);
+  });
+
+  test("a difference only in a trailing digit run is not drift", () => {
+    expect(isDriftVariant("kevinl", "kevin1")).toBe(false);
+    expect(isDriftVariant("alex1", "alexl")).toBe(false);
+    expect(isDriftVariant("alexll", "alex11")).toBe(false);
+    // Same trailing suffix, drift earlier in the handle: still drift.
+    expect(isDriftVariant("k3vin1", "kevin1")).toBe(true);
+  });
+
+  test("letter-for-letter swaps via a shared digit are not drift", () => {
+    expect(isDriftVariant("fixtureveil", "fixturevell")).toBe(false);
+  });
+
   test("unrelated handles do not match", () => {
     expect(isDriftVariant("fixtureveil", "fixturenew")).toBe(false);
     expect(isDriftVariant("john", "jane")).toBe(false);
@@ -61,6 +80,10 @@ describe("handle-drift: groupDriftKeys", () => {
   test("short keys (< 5 chars) never drift-group: bool vs bo0 stay apart", () => {
     // Keys below the min length are not eligible at all → no groups emitted.
     expect(groupDriftKeys(["bool", "bo0"])).toEqual([]);
+  });
+
+  test("trailing-digit suffix pairs stay apart even above the length guard", () => {
+    expect(groupDriftKeys(["kevinl", "kevin1"]).length).toBe(2);
   });
 
   test("unrelated long handles stay in their own groups", () => {

@@ -17,8 +17,18 @@
  * - Hour-class granularity (floor to the local wall-clock hour) means offsets
  *   30 minutes apart can only be distinguished when timestamps carry minute
  *   components — real Reddit data does, so this is fine in practice.
- * - Ties prefer the daytime-maximizing offset, then the smaller |offset|
- *   (an ambiguous distribution should collapse to UTC+00:00, not a coin flip).
+ * - Many offsets often tie at the minimum night share (an empty window fits
+ *   anywhere inside the subject's quiet gap). The estimate is the MIDPOINT of
+ *   the widest contiguous plateau of minimum-night offsets, and the plateau
+ *   bounds are reported. Picking the daytime-maximizing tied offset instead
+ *   skewed night owls west (true +05:30 active 09–24h → +04:30 "high").
+ *   The midpoint centres the quiet gap on local 04:00, so an unusual sleep
+ *   schedule still shifts it — hence the reported range.
+ * - Confidence comes from the contrast between the plateau's night share and
+ *   the MEDIAN offset's, plus a narrow plateau — not from the runner-up, which
+ *   is always a 30-minute neighbour with the same share.
+ * - A plateau covering the whole grid carries no signal and collapses to
+ *   UTC+00:00, not a coin flip.
  */
 
 /** Result of the sleep-window-fit timezone estimate. Pure data, no methods. */
@@ -33,10 +43,12 @@ export interface TimezoneEstimate {
   confidence: "low" | "medium" | "high";
   /** Share of posts whose local wall-clock hour falls in [01:00, 07:00) at the winning offset. */
   nightFraction: number;
-  /** Second-best offset by the same ordering, when a meaningful runner-up exists. */
-  runnerUpOffsetMinutes?: number;
-  /** Night-window share at the runner-up offset (the comparison that drives confidence). */
-  runnerUpNightFraction?: number;
+  /** Westmost offset of the minimum-night plateau the estimate is the midpoint of. */
+  plateauFromMinutes: number;
+  /** Eastmost offset of that plateau (equal to `plateauFromMinutes` for a sharp fit). */
+  plateauToMinutes: number;
+  /** Night-window share at the median candidate offset (the contrast that drives confidence). */
+  medianNightFraction: number;
   /** 24 bins: count of posts per local wall-clock hour at the WINNING offset. */
   localHourHistogram: number[];
 }
@@ -60,12 +72,6 @@ const CANDIDATE_OFFSETS: number[] = (() => {
   return out;
 })();
 
-interface CandidateScore {
-  offsetMinutes: number;
-  nightFraction: number;
-  dayFraction: number;
-}
-
 /** Local wall-clock hour (0–23) of a unix timestamp at a given offset. */
 function localHour(utcSeconds: number, offsetMinutes: number): number {
   const shifted = utcSeconds + offsetMinutes * 60;
@@ -88,76 +94,78 @@ export function estimateUtcOffset(timestamps: number[]): TimezoneEstimate | null
   const clean = timestamps.filter((t) => Number.isFinite(t) && t > 0);
   if (clean.length < 10) return null;
 
-  const scored: CandidateScore[] = CANDIDATE_OFFSETS.map((offsetMinutes) => {
-    let night = 0;
-    let day = 0;
+  const night = CANDIDATE_OFFSETS.map((offsetMinutes) => {
+    let n = 0;
     for (const ts of clean) {
       const h = localHour(ts, offsetMinutes);
-      if (h >= 1 && h < 7) night++;
-      else if (h >= 8 && h < 22) day++;
+      if (h >= 1 && h < 7) n++;
     }
-    return {
-      offsetMinutes,
-      nightFraction: night / clean.length,
-      dayFraction: day / clean.length,
-    };
+    return n / clean.length;
   });
+  const minNight = Math.min(...night);
 
-  // Order: fewest night posts, then most daytime posts, then smallest
-  // |offset| (prefer UTC+00:00 when truly ambiguous), then offset ascending
-  // so the sort is a total deterministic order.
-  scored.sort((a, b) => {
-    if (a.nightFraction !== b.nightFraction) return a.nightFraction - b.nightFraction;
-    if (a.dayFraction !== b.dayFraction) return b.dayFraction - a.dayFraction;
-    const aa = Math.abs(a.offsetMinutes);
-    const ab = Math.abs(b.offsetMinutes);
-    if (aa !== ab) return aa - ab;
-    return a.offsetMinutes - b.offsetMinutes;
-  });
-
-  const best = scored[0];
-  const runnerUp = scored[1]; // grid always has ≥2 candidates
+  // Contiguous runs of minimum-night offsets (indices into the grid); keep
+  // the widest, ties to the run whose midpoint is nearest UTC+00:00.
+  type Run = { from: number; to: number; mid: number };
+  const width = (r: Run) => r.to - r.from;
+  let plateau: Run | null = null;
+  for (let i = 0; i < night.length; i++) {
+    if (night[i] !== minNight || (i > 0 && night[i - 1] === minNight)) continue;
+    let j = i;
+    while (j + 1 < night.length && night[j + 1] === minNight) j++;
+    const run = { from: i, to: j, mid: Math.floor((i + j) / 2) };
+    if (
+      !plateau || width(run) > width(plateau) ||
+      (width(run) === width(plateau) && Math.abs(CANDIDATE_OFFSETS[run.mid]) < Math.abs(CANDIDATE_OFFSETS[plateau.mid]))
+    ) plateau = run;
+  }
+  const { from, to, mid } = plateau!; // minNight is attained, so a run exists
+  const wholeGrid = from === 0 && to === night.length - 1;
+  const offsetMinutes = wholeGrid ? 0 : CANDIDATE_OFFSETS[mid];
+  const plateauWidth = CANDIDATE_OFFSETS[to] - CANDIDATE_OFFSETS[from];
+  const sortedNight = [...night].sort((a, b) => a - b);
+  const medianNight = sortedNight[Math.floor(sortedNight.length / 2)];
 
   // Near-uniform hour distributions carry no clock signal: if the timestamps
   // occupy fewer than 4 distinct UTC hours, no offset can be preferred.
   const distinctUtcHours = new Set(clean.map((t) => Math.floor((t % 86400) / 3600))).size;
 
   let confidence: TimezoneEstimate["confidence"] = "low";
-  if (distinctUtcHours >= 4) {
-    if (clean.length >= 40 && best.nightFraction <= 0.5 * runnerUp.nightFraction) {
+  if (distinctUtcHours >= 4 && medianNight > 0) {
+    if (clean.length >= 40 && medianNight >= 0.1 && minNight <= 0.25 * medianNight && plateauWidth <= 60) {
       confidence = "high";
-    } else if (clean.length >= 20 && best.nightFraction < runnerUp.nightFraction) {
+    } else if (clean.length >= 20 && minNight <= 0.5 * medianNight && plateauWidth <= 240) {
       confidence = "medium";
     }
   }
 
   const histogram = new Array<number>(24).fill(0);
-  for (const ts of clean) histogram[localHour(ts, best.offsetMinutes)]++;
+  for (const ts of clean) histogram[localHour(ts, offsetMinutes)]++;
 
   return {
-    offsetMinutes: best.offsetMinutes,
-    label: formatOffsetLabel(best.offsetMinutes),
+    offsetMinutes,
+    label: formatOffsetLabel(offsetMinutes),
     postCount: clean.length,
     confidence,
-    nightFraction: best.nightFraction,
-    runnerUpOffsetMinutes: runnerUp.offsetMinutes,
-    runnerUpNightFraction: runnerUp.nightFraction,
+    nightFraction: minNight,
+    plateauFromMinutes: CANDIDATE_OFFSETS[from],
+    plateauToMinutes: CANDIDATE_OFFSETS[to],
+    medianNightFraction: medianNight,
     localHourHistogram: histogram,
   };
 }
 
 /**
  * Render the estimate as a "## Posting-Time Timezone Estimate" report block,
- * in the style of `renderWebSweepBlock`: the verdict, its evidence (night
- * fraction vs runner-up), the full local-hour histogram, and an honest
+ * in the style of `renderWebSweepBlock`: the verdict, its evidence (plateau
+ * range, night fraction vs the median offset), the full local-hour histogram, and an honest
  * caveat. The histogram lets a human reader second-guess the fit.
  */
 export function renderTimezoneBlock(est: TimezoneEstimate): string {
   const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
-  const runner =
-    est.runnerUpOffsetMinutes !== undefined && est.runnerUpNightFraction !== undefined
-      ? ` vs ${pct(est.runnerUpNightFraction)} at the runner-up offset ${formatOffsetLabel(est.runnerUpOffsetMinutes)}`
-      : "";
+  const range = est.plateauFromMinutes === est.plateauToMinutes
+    ? ""
+    : `; equally good fit across ${formatOffsetLabel(est.plateauFromMinutes)} … ${formatOffsetLabel(est.plateauToMinutes)} (midpoint reported)`;
 
   const hours = est.localHourHistogram.map((_, h) => String(h).padStart(2, "0")).join("|");
   const counts = est.localHourHistogram.map((c) => String(c).padStart(2, "0")).join("|");
@@ -168,8 +176,8 @@ export function renderTimezoneBlock(est: TimezoneEstimate): string {
     `*Deterministic sleep-window fit over the posting times (no LLM): the UTC offset whose local 01:00–07:00 window contains the smallest share of activity is the best-fit residence timezone. Same philosophy as the web sweep — regex/math the LLM cannot contradict.*`,
   );
   lines.push("");
-  lines.push(`- **Estimate**: **${est.label}** (confidence: ${est.confidence}; positive = east of UTC)`);
-  lines.push(`- **Basis**: ${est.postCount} posts/comments; local-night share at best fit: ${pct(est.nightFraction)}${runner}`);
+  lines.push(`- **Estimate**: **${est.label}** (confidence: ${est.confidence}; positive = east of UTC${range})`);
+  lines.push(`- **Basis**: ${est.postCount} posts/comments; local-night share at best fit: ${pct(est.nightFraction)} vs ${pct(est.medianNightFraction)} at the median offset`);
   lines.push(`- **Local hour histogram** (wall-clock hours at ${est.label}, 24 bins):`);
   lines.push("");
   lines.push("```");
@@ -191,9 +199,9 @@ export function renderTimezoneBlock(est: TimezoneEstimate): string {
  * re-derive it by eyeballing times.
  */
 export function renderTimezoneContextForPrompt(est: TimezoneEstimate): string {
-  const runner =
-    est.runnerUpNightFraction !== undefined
-      ? `; night-window fit ${(est.nightFraction * 100).toFixed(1)}% at best offset vs ${(est.runnerUpNightFraction * 100).toFixed(1)}% at runner-up`
-      : "";
-  return `POSTING-TIME TIMEZONE ESTIMATE (deterministic from ${est.postCount} posts/comments): ${est.label} (confidence: ${est.confidence}${runner}). Use this to corroborate or contradict location claims — it is a longitude band, not a country.`;
+  const range = est.plateauFromMinutes === est.plateauToMinutes
+    ? ""
+    : `; plausible range ${formatOffsetLabel(est.plateauFromMinutes)} … ${formatOffsetLabel(est.plateauToMinutes)}`;
+  const fit = `; night-window share ${(est.nightFraction * 100).toFixed(1)}% at best offset vs ${(est.medianNightFraction * 100).toFixed(1)}% at the median offset`;
+  return `POSTING-TIME TIMEZONE ESTIMATE (deterministic from ${est.postCount} posts/comments): ${est.label} (confidence: ${est.confidence}${range}${fit}). Use this to corroborate or contradict location claims — it is a longitude band, not a country.`;
 }

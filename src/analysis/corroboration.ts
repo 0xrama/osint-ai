@@ -42,7 +42,8 @@
 import { normalizeHandleKey, type DirectIdentifiers } from "./extract.ts";
 import { profileRootHandle, rankHandles, type WebSweepResult } from "./web-sweep.ts";
 import type { GitHubPassResult, GitHubIdentity } from "./github-pass.ts";
-import { isReclaimedHandle, nameLooksReal, type TwitterPassResult } from "./twitter-pass.ts";
+import { isReclaimedHandle, type TwitterPassResult } from "./twitter-pass.ts";
+import { disclosesHandle, isContentlessEmail, mentionsHandle, nameLooksReal, snippetAround } from "./match.ts";
 import type { AccountStatus, StructuredFindings, Finding, FindingCategory } from "./findings.ts";
 import { canonicalSourceUrl, buildVerdict, emptyVerdict, type AuditVerdict } from "./evidence.ts";
 import type { IdentityGraph, PersonEntity } from "./identity-graph.ts";
@@ -299,15 +300,6 @@ export function clamp(n: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, n));
 }
 
-/** GitHub-generated emails carry no identity — never cluster them. */
-function isContentlessEmail(email: string): boolean {
-  return (
-    /@users\.noreply\.github\.com$/i.test(email) ||
-    /@bots\.noreply\.github\.com$/i.test(email) ||
-    /^dependabot\[bot\]@/i.test(email)
-  );
-}
-
 /* ────────────────────────────────────────────────────────────────────────
  * Confidence calibration.
  * ──────────────────────────────────────────────────────────────────────── */
@@ -457,30 +449,6 @@ function addSource(
 
 function normPermalink(permalink: string): string {
   return canonicalSourceUrl(permalink) || permalink.trim();
-}
-
-/**
- * Word-boundary mention test for a handle spelling in free text — mirrors
- * web-sweep.ts's extractMentions (not exported, so re-implemented locally).
- * The preceding-char class excludes URL separators (`/ = & ?`) on TOP of the
- * word-boundary rule, so a handle inside a path/query fragment
- * (`/xyz42/i/`, `?id=xyz42`) does NOT count, while `@xyz42`, `[xyz42]`,
- * `"xyz42"` and bare ` xyz42 ` do. The trailing lookahead rejects run-ons
- * (`?id=xyz42abc`).
- */
-function mentionsHandleToken(text: string, handle: string): boolean {
-  const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^\\w/=&?])(${escaped})(?![\\w])`, "i").test(text);
-}
-
-/** Short verbatim snippet around the first occurrence of `handle` — evidence
- *  for corpus-mention sources that have no permalink. */
-function mentionSnippet(text: string, handle: string): string {
-  const idx = text.toLowerCase().indexOf(handle.toLowerCase());
-  if (idx < 0) return text.slice(0, 120);
-  const start = Math.max(0, idx - 40);
-  const end = Math.min(text.length, idx + handle.length + 40);
-  return text.slice(start, end).replace(/\s+/g, " ").trim();
 }
 
 function finalizeCluster(acc: ClusterAccumulator): CorroborationCluster {
@@ -997,8 +965,9 @@ function computeInner(
   // The corpus URL-extractor only matches full profile URLs, so a VERBAL
   // disclosure ("my discord is xyz42", no URL) never becomes an observation
   // and the handle registers as web-only / single-domain. Scan the raw corpus
-  // texts for word-boundary mentions of each clustered handle; each mentioning
-  // text is one reddit-domain source. The audited username never counts (its
+  // texts for DISCLOSURES of each clustered handle (match.ts disclosesHandle:
+  // handle-shaped context, so "I interned at Microsoft" never counts); each
+  // disclosing text is one reddit-domain source. The audited username never counts (its
   // cluster is already dropped above), and short norms (< 4 chars) are skipped
   // so ambient text doesn't fabricate sources.
   const handleClusterNorms = (): Array<{ acc: ClusterAccumulator; norm: string }> => {
@@ -1023,14 +992,15 @@ function computeInner(
         const ct = corpusTexts[i];
         const text = String(ct?.text ?? "");
         if (!text) continue;
-        const hit = spellings.find((s) => mentionsHandleToken(text, s));
+        let idx = -1;
+        const hit = spellings.find((s) => (idx = disclosesHandle(text, s)) >= 0);
         if (!hit) continue;
         const permalink = normPermalink(String(ct?.permalink ?? ""));
         addToCluster(
           acc,
           "reddit",
           `corpus:${permalink || i}`,
-          permalink || mentionSnippet(text, hit),
+          permalink || snippetAround(text, idx, hit.length),
         );
       }
     }
@@ -1040,7 +1010,16 @@ function computeInner(
   // often names a handle the URL-extractor missed. Their evidence permalinks
   // are corpus-validated upstream (validateStructuredFindings), so each
   // distinct permalink is one independent reddit-domain source for every
-  // handle cluster the claim mentions.
+  // handle cluster the claim mentions — provided THAT item's own text names
+  // the handle (token match; the finding supplies the "this is a handle"
+  // judgment the disclosure context rule would otherwise demand). An item
+  // missing from corpusTexts adds no weight. Without corpusTexts (legacy
+  // callers) the validated permalink alone counts.
+  const corpusTextByPermalink = new Map<string, string>();
+  for (const ct of corpusTexts) {
+    const key = normPermalink(String(ct?.permalink ?? ""));
+    if (key) corpusTextByPermalink.set(key, String(ct?.text ?? ""));
+  }
   for (const f of findings) {
     const cat = f?.category;
     if (cat !== "cross_platform_handle" && cat !== "external_link") continue;
@@ -1054,8 +1033,12 @@ function computeInner(
     if (permalinks.length === 0) continue;
     for (const { acc, norm } of handleClusterNorms()) {
       const spellings = [...acc.rawValues, norm].filter(Boolean);
-      if (!spellings.some((s) => mentionsHandleToken(claim, s))) continue;
+      if (!spellings.some((s) => mentionsHandle(claim, s))) continue;
       for (const p of permalinks) {
+        if (corpusTexts.length > 0) {
+          const text = corpusTextByPermalink.get(p);
+          if (!text || !spellings.some((s) => mentionsHandle(text, s))) continue;
+        }
         addToCluster(acc, "reddit", `permalink:${p}`, p);
       }
     }

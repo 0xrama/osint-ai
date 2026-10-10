@@ -167,6 +167,13 @@ describe("rankAltCandidates", () => {
     expect(ranked.length).toBe(1);
     expect(ranked[0].reasons.some((r) => r.includes("bio mentions"))).toBe(true);
   });
+
+  test("bio @-mention of a known handle scores; an email on its domain does not", () => {
+    const rank = (bio: string) =>
+      rankAltCandidates([profile({ screenName: "totallyunrelated", name: "x", bio })], { knownHandles });
+    expect(rank("alt of @fixtureveil").length).toBe(1);
+    expect(rank("mail me@fixtureveil.dev")).toEqual([]);
+  });
 });
 
 /* ── The pass (DI fake exec) ───────────────────────────────────────────── */

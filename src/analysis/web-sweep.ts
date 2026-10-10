@@ -44,6 +44,17 @@ import {
   normalizeHandleKey,
   type DirectIdentifiers,
 } from "./extract.ts";
+import {
+  MASTODON_HOST_RE,
+  RESERVED_SEED_WORDS,
+  findHandleMentions,
+  isReservedProfilePath,
+  isRoleMailbox,
+  isSeededHandleWord,
+  isVendorEmail,
+  mentionsHandle,
+  snippetAround,
+} from "./match.ts";
 import { generateDriftVariants, groupDriftKeys } from "./handle-drift.ts";
 import { followWebsite } from "./site-follower.ts";
 import { mapLimit } from "../runtime/concurrency.ts";
@@ -133,7 +144,7 @@ export function sweepCapable(): boolean {
 }
 
 /** Fixed battery of platform-targeted queries for the audited username.
- * Platform coverage mirrors extract.ts SOCIAL_PATTERNS: every platform the
+ * Platform coverage mirrors match.ts SOCIAL_PATTERNS: every platform the
  * extractor can read identifiers off must also be SEARCHED here, or a hit on
  * that platform never fires and the page is never scraped. */
 export function buildQueries(username: string): string[] {
@@ -209,35 +220,11 @@ function mentionsSeed(
   return haystack.includes(needle);
 }
 
-/** Extract up to N short snippets of `text` surrounding each occurrence of
- * `username` (case-insensitive). Uses a WORD-BOUNDARY token match (not a raw
- * substring) so boilerplate URL fragments like `/fixtureveil/i/...` or `id=fixtureveil`
- * don't trigger false bridge detections — only visible, standalone references
- * (badges, inline text, @-mentions) count as a stale-badge signal. */
+/** Snippets of `text` around up to `max` mentions of `username` (bridge-mode
+ * token match, see match.ts: `@h` counts, `h-dev`, emails and `/h/i/…` URL
+ * fragments do not). */
 function extractMentions(text: string, username: string, max = 3): string[] {
-  // Match username as a token: preceded by non-alphanumeric-or-@ (start, space,
-  // @, quotes, brackets, slash, pipe) and not followed by alphanumeric. This
-  // rejects `/fixtureveil/i/`, `?id=fixtureveilx`, etc., but keeps `@fixtureveil`, `[fixtureveil]`,
-  // `( fixtureveil )`, `"fixtureveil"`, ` fixtureveil `. Hyphens join handle tokens, so
-  // `fixtureveil-dev` (a different handle) never mentions `fixtureveil`.
-  const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`(^|[^\\w@-])(${escaped})(?![\\w-])`, "gi");
-  const out: string[] = [];
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null && out.length < max) {
-    const matchIdx = m.index + m[1].length;
-    const start = Math.max(0, matchIdx - 60);
-    const end = Math.min(text.length, matchIdx + username.length + 60);
-    const snippet = text.slice(start, end).replace(/\s+/g, " ").trim();
-    out.push(start > 0 ? `…${snippet}…` : snippet);
-  }
-  return out;
-}
-
-/** Word-boundary mention test over a link's VISIBLE LABEL only. */
-function mentionInLabel(label: string, handle: string): boolean {
-  const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^\\w@-])(${escaped})(?![\\w-])`, "i").test(label);
+  return findHandleMentions(text, username, max).map((i) => snippetAround(text, i, username.length));
 }
 
 /**
@@ -262,7 +249,7 @@ function extractAnchorBridges(
     if (!targetHandle) continue;
     for (const h of knownHandles) {
       if (!h || normalizeHandleKey(targetHandle) === normalizeHandleKey(h)) continue;
-      if (mentionInLabel(label, h)) {
+      if (mentionsHandle(label, h)) {
         out.push({ target: h, anchorTarget: targetHandle, snippet: `[${label}](${href})` });
         break; // one label can be at most one rename edge
       }
@@ -277,18 +264,17 @@ function extractAnchorBridges(
 const LINK_AGGREGATOR_RE =
   /(^|\.)(linktr\.ee|beacons\.ai|carrd\.co|bio\.link|solo\.to|flow\.page|lnk\.bio|bento\.me|about\.me|allmylinks\.com|hihello\.me)$/i;
 
-/** Mastodon instance hosts we treat as scrapeable profile platforms. Keep in
- * sync with the mastodon pattern in extract.ts SOCIAL_PATTERNS — when that
- * list grows (new instance suffixes or named instances), grow this too. */
-const MASTODON_HOST_RE =
-  /(^|\.)(mastodon\.[a-z.]+|mstdn\.[a-z.]+|fosstodon\.org|hachyderm\.io|infosec\.exchange)$/i;
-
 /** Big social/dev platforms — scraped via Firecrawl directly (their profile
  * pages render server-side or Firecrawl handles the JS). Mirrors the
- * extractor's platform set (extract.ts SOCIAL_PATTERNS) so every platform we
- * can READ identifiers from is also a platform we will SCRAPE. */
+ * extractor's platform set (match.ts SOCIAL_PATTERNS, Mastodon hosts
+ * included) so every platform we can READ identifiers from is also a
+ * platform we will SCRAPE. */
 const BIG_PLATFORM_RE =
-  /(^|\.)(github\.com|x\.com|twitter\.com|instagram\.com|t\.me|linkedin\.com|facebook\.com|youtube\.com|gitlab\.com|bsky\.app|stackoverflow\.com|news\.ycombinator\.com|mastodon\.[a-z.]+|mstdn\.[a-z.]+|fosstodon\.org|hachyderm\.io|infosec\.exchange)$/i;
+  /(^|\.)(github\.com|x\.com|twitter\.com|instagram\.com|t\.me|linkedin\.com|facebook\.com|youtube\.com|gitlab\.com|bsky\.app|stackoverflow\.com|news\.ycombinator\.com)$/i;
+
+function isBigPlatformHost(host: string): boolean {
+  return BIG_PLATFORM_RE.test(host) || MASTODON_HOST_RE.test(host);
+}
 
 /** Domains that produce commerce/SEO noise (mirror of profileRootHandle).
  * youtube deliberately NOT here — it is a real profile platform. */
@@ -321,7 +307,7 @@ export function scoreBridgeEntry(
     let host = "";
     try { host = new URL(ownerUrl).hostname.toLowerCase(); } catch { host = ""; }
     if (host && LINK_AGGREGATOR_RE.test(host)) score = 0.9;
-    else if (host && BIG_PLATFORM_RE.test(host)) score = 0.8;
+    else if (host && isBigPlatformHost(host)) score = 0.8;
     else score = 0.5;
   }
   if (reciprocal) score = Math.min(1, score + 0.2);
@@ -385,44 +371,6 @@ const FREEMAIL_DOMAINS = new Set([
 ]);
 
 /**
- * Words that must never snowball into SEARCH SEEDS. Extracted "handles" like
- * `github` (the org), `download`, `trending_repos` are platform plumbing, not
- * people — and they are POISONOUS twice over: the search battery wastes
- * queries on them, and a seed named "github" then substring-matches the word
- * GitHub on every scraped page, manufacturing fake bridge edges wholesale.
- * Also excluded as mention targets in bridge detection.
- */
-const RESERVED_SEED_WORDS = new Set([
-  "github", "gitlab", "git", "twitter", "x", "instagram", "linkedin", "reddit",
-  "telegram", "youtube", "discord", "twitch", "medium", "substack", "tiktok",
-  "facebook", "threads", "mastodon", "bluesky", "bsky", "snapchat", "pinterest",
-  "download", "downloads", "trending", "trending_repos", "explore", "search",
-  "login", "signup", "signin", "home", "about", "contact", "blog", "docs",
-  "developer", "status", "events", "universe", "help", "support", "settings",
-  "notifications", "new", "org", "orgs", "com", "www", "app", "api", "mail",
-]);
-
-/** Vendor/system mailbox local parts — never identity seeds (abuse@, dmca@,
- * noreply@ … belong to the SITE we scraped, not to the subject). */
-const VENDOR_EMAIL_LOCALPARTS = /^(abuse|dmca|noreply|no-?reply|donotreply|info|support|help|privacy|legal|partners|contact|sales|admin|administrator|webmaster|security|postmaster|marketing|press|media|team|hello|hi|office|mail|billing|trust|safety|copyright|compliance)$/i;
-
-export function isSeededHandleWord(handle: string): boolean {
-  const norm = normalizeHandleKey(handle);
-  return norm.length < 3 || RESERVED_SEED_WORDS.has(norm);
-}
-
-/** Role/system mailbox (abuse@, info@, noreply@ …): never the subject's
- *  identity unless it sits on their own site's domain. */
-export function isRoleMailbox(email: string): boolean {
-  return VENDOR_EMAIL_LOCALPARTS.test(email.split("@")[0] ?? "");
-}
-
-/** Seed filter: role mailboxes plus very short local parts (too generic to search). */
-function isVendorEmail(email: string): boolean {
-  return (email.split("@")[0] ?? "").length < 4 || isRoleMailbox(email);
-}
-
-/**
  * URLs worth scraping: IDENTITY PROFILE ROOTS only. Rejects tweet/status
  * pages, IG reels, search URLs, and e-shop/crypto noise — those pages just
  * link to random unrelated accounts and flood the extractor with false
@@ -438,22 +386,22 @@ export function profileRootHandle(url: string): string | null {
   // org/plumbing pages like /gist, /download, /githubuniverse — not people)
   if (/github\.com$/.test(host) && seg.length === 1) {
     const h = seg[0];
-    if (!/^(issues|pull|search|trending|trending_repos|marketplace|orgs|topics|collections|notifications|settings|new|features|pricing|enterprise|sponsors|about|login|join|signup|gist|download|downloads|blog|docs|community|events|universe|githubuniverse|nonprofit|mobile|explore)$/i.test(h)) return h;
+    if (!isReservedProfilePath("github", h)) return h;
   }
   // x.com/<user> or twitter.com/<user>  (NOT /status, /search, /home)
   if (/(^|\.)(x\.com|twitter\.com)$/.test(host) && seg.length === 1) {
     const h = seg[0];
-    if (!/^(home|search|explore|intent|share|hashtag|notifications|messages|settings|i|compose|login|signup|tos|privacy|about)$/i.test(h)) return h;
+    if (!isReservedProfilePath("x", h)) return h;
   }
   // instagram.com/<user>  (NOT /reel, /p, /explore, /accounts)
   if (/instagram\.com$/.test(host) && seg.length === 1) {
     const h = seg[0];
-    if (!/^(p|reel|reels|tv|accounts|explore|stories|about|developer)$/i.test(h)) return h;
+    if (!isReservedProfilePath("instagram", h)) return h;
   }
   // t.me/<user>  (NOT /s, /joinchat)
   if (/t\.me$/.test(host) && seg.length === 1) {
     const h = seg[0];
-    if (!/^(joinchat|s)$/i.test(h)) return h;
+    if (!isReservedProfilePath("telegram", h)) return h;
   }
   // linkedin.com/in/<user>
   if (/linkedin\.com$/.test(host) && seg.length === 2 && seg[0].toLowerCase() === "in") return seg[1];
@@ -468,7 +416,7 @@ export function profileRootHandle(url: string): string | null {
   // gitlab.com/<user>  (NOT /explore, /help, /users, /projects, …)
   if (/gitlab\.com$/.test(host) && seg.length === 1) {
     const h = seg[0];
-    if (!/^(explore|help|users|projects|search|public|dashboard|admin|signin|register|about)$/i.test(h)) return h;
+    if (!isReservedProfilePath("gitlab", h)) return h;
   }
   // bsky.app/profile/<handle> — the handle may be dotted or a did:plc
   if (/bsky\.app$/.test(host) && seg.length === 2 && seg[0].toLowerCase() === "profile") return seg[1];
@@ -490,7 +438,7 @@ export function profileRootHandle(url: string): string | null {
   }
 
   // Personal sites: root or identity-shaped path on a non-noise domain.
-  if (!NOISE_HOST_RE.test(host) && !BIG_PLATFORM_RE.test(host)) {
+  if (!NOISE_HOST_RE.test(host) && !isBigPlatformHost(host)) {
     if (seg.length === 0) return u.hostname.split(".")[0]; // root
     if (/^(about|cv|resume|bio|contact|me|portfolio|profile|info)$/i.test(seg[0])) return u.hostname.split(".")[0];
   }
@@ -518,7 +466,7 @@ function chaseableLinks(links: string[], alreadyKnown: (url: string) => boolean,
     if (seen.has(norm) || alreadyKnown(link)) continue;
     seen.add(norm);
     if (LINK_AGGREGATOR_RE.test(u.hostname)) aggregators.push(norm);
-    else if (!NOISE_HOST_RE.test(u.hostname) && !BIG_PLATFORM_RE.test(u.hostname) && profileRootHandle(norm) !== null) personalSites.push(norm);
+    else if (!NOISE_HOST_RE.test(u.hostname) && !isBigPlatformHost(u.hostname) && profileRootHandle(norm) !== null) personalSites.push(norm);
   }
   return [...aggregators, ...personalSites].slice(0, max);
 }
@@ -605,7 +553,7 @@ async function scrapeCandidate(
   let host = "";
   try { host = new URL(url).hostname.toLowerCase(); } catch { return null; }
 
-  if (BIG_PLATFORM_RE.test(host) || NOISE_HOST_RE.test(host)) {
+  if (isBigPlatformHost(host) || NOISE_HOST_RE.test(host)) {
     const page = await scrape(url, { onlyMainContent: false, links: true });
     return {
       text: `=== ${url} ===\n${page.title}\n${page.markdown}`,
@@ -1043,7 +991,7 @@ export async function runDeterministicWebSweep(
   const hostOf = (url: string) => { try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; } };
   const ownSiteMailbox = (email: string) => scrapedPages.some((p) => {
     const host = hostOf(p.source);
-    return host === email.split("@")[1] && !BIG_PLATFORM_RE.test(host) && extractEmails(p.text).includes(email);
+    return host === email.split("@")[1] && !isBigPlatformHost(host) && extractEmails(p.text).includes(email);
   });
   const identifiers = { ...extracted, emails: extracted.emails.filter((e) => !isRoleMailbox(e) || ownSiteMailbox(e)) };
   const identifierSources = attributeSources(scrapedPages, identifiers);

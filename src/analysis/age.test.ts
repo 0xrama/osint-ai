@@ -15,11 +15,13 @@ import {
 } from "./age.ts";
 
 const NOW = new Date("2026-10-03T00:00:00Z");
+/** Wrap bare strings as undated subject texts. */
+const undated = (...texts: string[]) => texts.map((text) => ({ text }));
 
 describe("estimateAges", () => {
   test("2nd-year BSc stated near Nov 2024 → enrolled ~2023, born ~2005, age 20–21, medium", () => {
     const texts = ["posted Nov 2024 — honestly I'm in my 2nd year of my BSc and it's rough"];
-    const estimates = estimateAges(texts, NOW);
+    const estimates = estimateAges(undated(...texts), NOW);
     const edu = estimates.filter((e) => e.program === "bachelor");
     expect(edu.length).toBeGreaterThanOrEqual(1);
     const est = edu[0];
@@ -43,7 +45,7 @@ describe("estimateAges", () => {
   });
 
   test("graduated B.Tech in 2021 → born ~1999 window (duration ambiguity), mid-20s+", () => {
-    const estimates = estimateAges(["I graduated B.Tech in 2021 and have been working since"], NOW);
+    const estimates = estimateAges(undated("I graduated B.Tech in 2021 and have been working since"), NOW);
     const edu = estimates.filter((e) => e.program === "bachelor");
     expect(edu.length).toBe(1);
     const est = edu[0];
@@ -58,7 +60,7 @@ describe("estimateAges", () => {
   });
 
   test("doing my master's, started in 2022 → born ~2001", () => {
-    const estimates = estimateAges(["right now I'm doing my master's, started in 2022"], NOW);
+    const estimates = estimateAges(undated("right now I'm doing my master's, started in 2022"), NOW);
     const edu = estimates.filter((e) => e.program === "master");
     expect(edu.length).toBe(1);
     const est = edu[0];
@@ -71,7 +73,7 @@ describe("estimateAges", () => {
   });
 
   test("bracket-only ('in my twenties', no year) → low confidence, wide range", () => {
-    const estimates = estimateAges(["no dates at all in this one, just: I'm in my twenties lol"], NOW);
+    const estimates = estimateAges(undated("no dates at all in this one, just: I'm in my twenties lol"), NOW);
     expect(estimates.filter((e) => e.program !== "bracket")).toEqual([]);
     const brackets = estimates.filter((e) => e.program === "bracket");
     expect(brackets.length).toBe(1);
@@ -82,7 +84,7 @@ describe("estimateAges", () => {
   });
 
   test("no education signal → empty estimates and empty block", () => {
-    const estimates = estimateAges(["just talking about bikes and coffee, nothing personal"], NOW);
+    const estimates = estimateAges(undated("just talking about bikes and coffee, nothing personal"), NOW);
     expect(estimates).toEqual([]);
     expect(renderAgeBlock(estimates, NOW)).toBe("");
   });
@@ -92,17 +94,60 @@ describe("estimateAges", () => {
       "back in 2020 I was in my 1st year of college",
       "graduated with a BSc in 2019, then started my MSc in 2022",
     ];
-    const a: AgeEstimate[] = estimateAges(texts, NOW);
-    const b: AgeEstimate[] = estimateAges(texts, NOW);
+    const a: AgeEstimate[] = estimateAges(undated(...texts), NOW);
+    const b: AgeEstimate[] = estimateAges(undated(...texts), NOW);
     expect(a).toEqual(b);
     expect(renderAgeBlock(a, NOW)).toBe(renderAgeBlock(b, NOW));
+  });
+});
+
+describe("degree keyword boundaries", () => {
+  test("'maybe' / 'to be' never read as B.E., so a job '2nd year' anchors nothing", () => {
+    const texts = undated(
+      "I am in my 2nd year at the company, maybe moving to Berlin in 2023.",
+      "third year in this flat, to be honest the rent went up in 2021",
+    );
+    expect(estimateAges(texts, NOW)).toEqual([]);
+  });
+
+  test("dotted or capitalised B.E / B.A still count", () => {
+    for (const t of ["2nd year of my B.E. in 2022", "2nd year BE student, 2022", "2nd year of my B.A in 2022"]) {
+      expect(parseEducationTimelines(t).map((m) => m.program)).toEqual(["bachelor"]);
+    }
+  });
+
+  test("'college' needs a word start (no match inside another word)", () => {
+    expect(parseEducationTimelines("2nd year of mycollege-themed blog, 2022")).toEqual([]);
+  });
+});
+
+describe("posting-year anchor", () => {
+  test("an undated present-tense milestone is stated in the item's posting year", () => {
+    const estimates = estimateAges([{ text: "I'm in my 2nd year of my BSc and it's rough", postedYear: 2024 }], NOW);
+    expect(estimates.map((e) => e.birthYearRange)).toEqual([[2005, 2005]]);
+  });
+
+  test("an undated past-tense milestone is not dated to the posting year", () => {
+    expect(estimateAges([{ text: "my 2nd year of college was rough", postedYear: 2024 }], NOW)).toEqual([]);
+  });
+
+  test("an explicit nearby year beats the posting year", () => {
+    const [ms] = parseEducationTimelines("I graduated B.Tech in 2021", 2025);
+    expect(ms.year).toBe(2021);
+    expect(ms.yearKind).toBe("graduated");
+  });
+
+  test("years never leak across items", () => {
+    // The year sits in a different post: on its own, the BSc claim is undated.
+    const estimates = estimateAges(undated("I'm in my 2nd year of my BSc", "bought a bike in 2019"), NOW);
+    expect(estimates).toEqual([]);
   });
 });
 
 describe("renderAgeBlock", () => {
   test("renders the framing line, chains, and flags disagreement loudly", () => {
     const estimates = estimateAges(
-      ["I'm in my 3rd year of my BSc (Nov 2024 diary entry)", "I graduated my B.Com back in 2015"],
+      undated("I'm in my 3rd year of my BSc (Nov 2024 diary entry)", "I graduated my B.Com back in 2015"),
       NOW,
     );
     const block = renderAgeBlock(estimates, NOW);
@@ -115,7 +160,7 @@ describe("renderAgeBlock", () => {
   });
 
   test("single agreeing estimate renders a consensus line, no conflict", () => {
-    const estimates = estimateAges(["in my 2nd year of B.Tech, fall 2024"], NOW);
+    const estimates = estimateAges(undated("in my 2nd year of B.Tech, fall 2024"), NOW);
     const block = renderAgeBlock(estimates, NOW);
     expect(block).toContain("Consensus");
     expect(block).not.toContain("⚠ CONFLICT");

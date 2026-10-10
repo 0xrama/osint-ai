@@ -275,7 +275,7 @@ describe("web-sweep drift-variant search seeds", () => {
 });
 
 /**
- * Platform battery alignment: the extractor (extract.ts SOCIAL_PATTERNS)
+ * Platform battery alignment: the extractor (match.ts SOCIAL_PATTERNS)
  * recognizes 12 platforms — the sweep's query battery and profile-root parser
  * must cover the same set, otherwise an extractable platform is never searched
  * (a site:gitlab.com hit can't fire) or its profile URL is never scraped
