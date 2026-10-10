@@ -13,12 +13,13 @@
  */
 
 import type { EvalFixture, EvalMetrics, AggregateMetrics } from "./schema.ts";
-import { buildSweepDeps, scoreIdentifiers, scoreBridges, scoreHandleAttribution, scoreAttribution, scoreContradictions, computePRF1, aggregateMetrics } from "./schema.ts";
+import { buildSweepDeps, scoreIdentifiers, scoreBridges, scoreHandleAttribution, scoreAttribution, scoreContradictions, scoreFusion, computePRF1, aggregateMetrics } from "./schema.ts";
 import { runDeterministicWebSweep } from "../analysis/web-sweep.ts";
-import { runGitHubPass, buildGitHubDepsFromFixture, gitHubIdentifiers } from "../analysis/github-pass.ts";
+import { runGitHubPass, mergeGitHubPass, buildGitHubDepsFromFixture, gitHubIdentifiers } from "../analysis/github-pass.ts";
 import { extractDirectIdentifiers, type DirectIdentifiers } from "../analysis/extract.ts";
 import { buildCorpusManifest, validateStructuredFindings } from "../analysis/findings.ts";
 import { computeCorroboration } from "../analysis/corroboration.ts";
+import { buildIdentityGraph } from "../analysis/identity-graph.ts";
 import type { WebSweepResult } from "../analysis/web-sweep.ts";
 import type { GitHubPassResult } from "../analysis/github-pass.ts";
 
@@ -70,6 +71,19 @@ async function runFixture(fixture: EvalFixture): Promise<{ metrics: EvalMetrics 
       corpusIds = extractDirectIdentifiers(manifest.texts, inputs.username);
     }
 
+    // 3b. Corpus-disclosed GitHub handles — mirrors runAudit's post-corpus
+    //     pass: probe handles the first pass didn't query, then merge.
+    if (Object.keys(inputs.githubProfiles).length > 0) {
+      const queried = new Set((gitHub?.queried ?? []).map((q) => q.toLowerCase()));
+      const corpusGh = [...new Set(
+        corpusIds.socialHandles.filter((h) => h.platform === "github").map((h) => h.handle),
+      )].filter((h) => !queried.has(h.toLowerCase()));
+      if (corpusGh.length > 0) {
+        const ghDeps = buildGitHubDepsFromFixture(inputs.githubProfiles, inputs.githubCommits);
+        gitHub = mergeGitHubPass(gitHub, await runGitHubPass(corpusGh, { maxSeeds: 5, reposPerUser: 3, deps: ghDeps }));
+      }
+    }
+
     // 4. Web identifiers from the sweep
     const webIds = sweep.identifiers;
 
@@ -78,12 +92,13 @@ async function runFixture(fixture: EvalFixture): Promise<{ metrics: EvalMetrics 
       ? gitHubIdentifiers(gitHub)
       : { emails: [], socialHandles: [] };
 
-    // 6. Corroboration (deterministic, no LLM)
-    const corroboration = computeCorroboration({
+    // Match production person ownership before scoring.
+    const corpusTexts = (inputs.redditHistory ?? []).map((item) => ({
+      text: `${item.title ?? ""} ${item.body ?? ""}`, permalink: item.permalink,
+    }));
+    const identityGraph = buildIdentityGraph({
       username: inputs.username,
-      directIdentifiers: corpusIds,
-      webSweep: sweep,
-      gitHub: gitHub ?? undefined,
+      corpusIdentifiers: corpusIds, corpusTexts, webSweep: sweep, gitHub: gitHub ?? undefined,
     });
 
     // 7. Build StructuredFindings from fixture-supplied findings (LLM mock)
@@ -110,16 +125,10 @@ async function runFixture(fixture: EvalFixture): Promise<{ metrics: EvalMetrics 
       corpusManifest,
     );
 
-    // Re-run corroboration with the mock findings if the fixture provides them.
-    const finalCorroboration = sfFindings.length > 0
-      ? computeCorroboration({
-          username: inputs.username,
-          structured,
-          directIdentifiers: corpusIds,
-          webSweep: sweep,
-          gitHub: gitHub ?? undefined,
-        })
-      : corroboration;
+    const finalCorroboration = computeCorroboration({
+      username: inputs.username, identityGraph, corpusTexts,
+      structured, directIdentifiers: corpusIds, webSweep: sweep, gitHub: gitHub ?? undefined,
+    });
 
     // 8. Score against ground truth
     const allId = mergeIdentifierSets([corpusIds, webIds, githubIds]);
@@ -145,6 +154,7 @@ async function runFixture(fixture: EvalFixture): Promise<{ metrics: EvalMetrics 
 
     const attribution = scoreAttribution(finalCorroboration, groundTruth);
     const contradiction = scoreContradictions(finalCorroboration.contradictions, groundTruth);
+    const fusion = scoreFusion(identityGraph, groundTruth, inputs.username);
 
     const metrics: EvalMetrics = {
       fixtureId: id,
@@ -159,6 +169,10 @@ async function runFixture(fixture: EvalFixture): Promise<{ metrics: EvalMetrics 
       attributionTop1Correct: attribution.top1Correct,
       attributionTopKCorrect: attribution.topKCorrect,
       contradictionCorrect: contradiction.correct,
+      fusionRecall: fusion.recall,
+      fusionFalseLinks: fusion.falseLinks,
+      actualRisk: finalCorroboration.overallRisk,
+      riskCorrect: !groundTruth.expectedRisk || finalCorroboration.overallRisk === groundTruth.expectedRisk,
       truePositives: idScore.tp,
       falsePositives: idScore.fp,
       falseNegatives: idScore.fn,
@@ -235,14 +249,17 @@ export function formatEvalReport(ag: AggregateMetrics): string {
   lines.push(`| Mean candidate-link precision | ${(ag.meanCandidateLinkPrecision * 100).toFixed(1)}% |`);
   lines.push(`| Attribution top-1 rate | ${(ag.attributionTop1Rate * 100).toFixed(1)}% |`);
   lines.push(`| Contradiction accuracy | ${(ag.contradictionAccuracy * 100).toFixed(1)}% |`);
+  lines.push(`| Mean fusion recall | ${(ag.meanFusionRecall * 100).toFixed(1)}% |`);
+  lines.push(`| Fixtures with false fusion links | ${ag.fusionFalseLinkCount} |`);
+  lines.push(`| Risk accuracy (vs expectedRisk) | ${(ag.riskAccuracy * 100).toFixed(1)}% |`);
   lines.push("");
   lines.push("## Per-fixture details");
   lines.push("");
-  lines.push(`| Fixture | ID F1 | Bridge F1 | Link Prec | Top-1 | Contra |`);
-  lines.push(`|---------|-------|-----------|-----------|-------|--------|`);
+  lines.push(`| Fixture | ID F1 | Bridge F1 | Link Prec | Top-1 | Contra | Fusion | Risk |`);
+  lines.push(`|---------|-------|-----------|-----------|-------|--------|--------|------|`);
   for (const m of ag.perFixture) {
     lines.push(
-      `| ${m.fixtureId} | ${(m.identifierF1 * 100).toFixed(0)}% | ${(m.bridgePrecision + m.bridgeRecall > 0 ? ((2 * m.bridgePrecision * m.bridgeRecall) / (m.bridgePrecision + m.bridgeRecall) * 100).toFixed(0) : 0)}% | ${(m.candidateLinkPrecision * 100).toFixed(0)}% | ${m.attributionTop1Correct ? "✓" : "✗"} | ${m.contradictionCorrect ? "✓" : "✗"} |`,
+      `| ${m.fixtureId} | ${(m.identifierF1 * 100).toFixed(0)}% | ${(m.bridgePrecision + m.bridgeRecall > 0 ? ((2 * m.bridgePrecision * m.bridgeRecall) / (m.bridgePrecision + m.bridgeRecall) * 100).toFixed(0) : 0)}% | ${(m.candidateLinkPrecision * 100).toFixed(0)}% | ${m.attributionTop1Correct ? "✓" : "✗"} | ${m.contradictionCorrect ? "✓" : "✗"} | ${(m.fusionRecall * 100).toFixed(0)}%${m.fusionFalseLinks.length ? ` ⚠${m.fusionFalseLinks.length}` : ""} | ${m.actualRisk}${m.riskCorrect ? "" : " ✗"} |`,
     );
   }
 

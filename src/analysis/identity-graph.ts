@@ -40,12 +40,18 @@
  *     person-level join.
  *   - Disclosure edges point AT the audited-username node: the subject
  *     verbally disclosed the handle in their own corpus, which ties that
- *     handle to the audited identity.
+ *     handle to the audited identity. Emails found in the corpus get the
+ *     same edge (vendor/noreply mailboxes excluded).
+ *   - A GitHub/X account whose login equals the audited username is NOT the
+ *     subject by string equality alone: when nothing links it (bridge, corpus
+ *     link to the account or its emails) and the subject's posts contradict
+ *     its location/company, its profile fields hang off a separate
+ *     `handle:<key>@<platform>` node — a namesake person.
  */
 
 import { normalizeHandleKey, type DirectIdentifiers, type SocialHandle } from "./extract.ts";
 import { isDriftVariant } from "./handle-drift.ts";
-import { rankHandles, type WebSweepResult } from "./web-sweep.ts";
+import { isRoleMailbox, isSeededHandleWord, rankHandles, type WebSweepResult } from "./web-sweep.ts";
 import type { GitHubPassResult } from "./github-pass.ts";
 import type { TwitterPassResult } from "./twitter-pass.ts";
 
@@ -117,27 +123,6 @@ export interface IdentityGraphInput {
  * Local mirrors of module-private helpers
  * ──────────────────────────────────────────────────────────────────────── */
 
-/**
- * Mirror of web-sweep.ts `RESERVED_SEED_WORDS` (module-private there; this
- * file may not edit it). Platform plumbing ("github", "download", …) must
- * never become graph nodes: a node named `github` would word-match on every
- * page and manufacture fake edges wholesale. Keep in sync with web-sweep.ts.
- */
-const RESERVED_SEED_WORDS = new Set([
-  "github", "gitlab", "git", "twitter", "x", "instagram", "linkedin", "reddit",
-  "telegram", "youtube", "discord", "twitch", "medium", "substack", "tiktok",
-  "facebook", "threads", "mastodon", "bluesky", "bsky", "snapchat", "pinterest",
-  "download", "downloads", "trending", "trending_repos", "explore", "search",
-  "login", "signup", "signin", "home", "about", "contact", "blog", "docs",
-  "developer", "status", "events", "universe", "help", "support", "settings",
-  "notifications", "new", "org", "orgs", "com", "www", "app", "api", "mail",
-]);
-
-/** Mirror of web-sweep.ts `isSeededHandleWord` (same reserved-word hygiene). */
-function isReservedKey(key: string): boolean {
-  return key.length < 3 || RESERVED_SEED_WORDS.has(key);
-}
-
 /** Mirror of github-pass.ts `isContentlessEmail` — GitHub-generated mailboxes
  * carry no identity and must not become email nodes. */
 function isContentlessEmail(email: string): boolean {
@@ -203,6 +188,41 @@ function nameKey(name: string): string {
   return name.toLowerCase().replace(/\s+/g, " ").trim();
 }
 
+/* Subject self-statements of residence / employer in their own posts.
+ * Residence only ("I'm from X" is origin, which a profile location need not
+ * match); the captured phrase is a run of capitalized words. */
+const SELF_LOCATION_RE = /\b[Ii](?:'m| am)? (?:live|living|based|moved) (?:in|to) ((?:\p{Lu}[\p{L}'-]+[ ,]*)+)/gu;
+const SELF_EMPLOYER_RE = /\b[Ii](?:'m| am)? (?:work|working) (?:at|for) ((?:\p{Lu}[\p{L}&'.-]*[ ]?)+)/gu;
+
+function placeTokens(s: string): string[] {
+  return s.toLowerCase().split(/[^\p{L}]+/u).filter((t) => t.length >= 3);
+}
+
+/**
+ * True when the subject's own posts state a residence/employer that the
+ * profile's location/company shares no word with, and no stated value agrees
+ * with the profile. A username-only string match carries no evidence of its
+ * own, so this negative evidence is enough to keep its fields out of the
+ * subject person.
+ */
+function profileContradictsCorpus(
+  profile: { location?: string; company?: string },
+  corpusTexts: Array<{ text: string }>,
+): boolean {
+  let mismatch = false;
+  for (const [field, re] of [[profile.location, SELF_LOCATION_RE], [profile.company, SELF_EMPLOYER_RE]] as const) {
+    const fieldTokens = placeTokens(field ?? "");
+    if (fieldTokens.length === 0) continue;
+    for (const { text } of corpusTexts) {
+      for (const m of text.matchAll(re)) {
+        if (placeTokens(m[1]).some((t) => fieldTokens.includes(t))) return false;
+        mismatch = true;
+      }
+    }
+  }
+  return mismatch;
+}
+
 /* Edge strengths — fixed by edge semantics (see module JSDoc). */
 const STRENGTH = {
   rename: 0.7,
@@ -242,12 +262,15 @@ interface HandleBucket {
  *     the stale-badge bridge. Owner (current identity) → target (stale).
  *   - `anchor-rename` (1.0): the strongest bridge variant — a link whose
  *     visible text is the old handle but whose target is a different profile
- *     root. Direction is unambiguous, so is the strength.
+ *     root. Direction is unambiguous, so is the strength: link target (new)
+ *     → label (old), whoever owns the page.
  *   - `drift` (0.6): two handle nodes whose normalized keys are digit/letter
  *     drift variants (fixtureveil ↔ fixtureve1l), keys ≥5 chars.
  *   - `disclosure` (0.8): the corpus verbally mentions a discovered handle
  *     (word-boundary, URL-fragment-safe) → edge INTO the audited-username
  *     node, tying the handle to the audited identity.
+ *     A corpus-extracted email (non-vendor, non-noreply) gets the same
+ *     edge, evidence = the permalinks of the posts containing it.
  *   - `email-of` (0.9 GitHub profile/commit email; 0.6 email local-part
  *     heuristic): email belongs to the handle's owner.
  *   - `name-of` (0.8): real-name leak on a GitHub/Twitter profile.
@@ -322,7 +345,7 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
   /* ── 3. Handle nodes (reserved-word hygiene, audited username exempt) ─ */
   const handleNodes = new Map<string, IdentityGraphNode>();
   for (const [key, b] of buckets) {
-    if (isReservedKey(key) && key !== auditedKey) continue;
+    if (isSeededHandleWord(key) && key !== auditedKey) continue;
     let display = primaryDisplay.get(key);
     if (!display || !b.variants.includes(display)) {
       // Most-seen bucket variant; ties break lexicographically (determinism).
@@ -351,7 +374,17 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
   for (const e of sweep?.identifiers.emails ?? []) {
     addEmail(e, sweep?.identifierSources?.emails[e.toLowerCase()] ?? []);
   }
-  for (const e of input.corpusIdentifiers?.emails ?? []) addEmail(e, []);
+  // Corpus emails: provenance = the permalinks of the subject's own posts
+  // that contain them (reused as disclosure evidence in 5c).
+  const corpusEmailPermalinks = new Map<string, string[]>();
+  for (const e of input.corpusIdentifiers?.emails ?? []) {
+    const lc = e.toLowerCase();
+    const permalinks = (input.corpusTexts ?? [])
+      .filter((t) => t.permalink && t.text.toLowerCase().includes(lc))
+      .map((t) => t.permalink!);
+    corpusEmailPermalinks.set(lc, permalinks);
+    addEmail(e, permalinks);
+  }
   for (const e of input.twitter?.identifiers.emails ?? []) {
     addEmail(e, input.twitter?.identifierSources.emails[e.toLowerCase()] ?? []);
   }
@@ -436,14 +469,17 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
       for (const e of entries) {
         const target = handleNodes.get(normalizeHandleKey(e.target ?? input.username));
         if (!target) continue;
-        const isAnchor = e.kind === "anchor-rename";
-        addEdge(
-          owner.id,
-          target.id,
-          isAnchor ? "anchor-rename" : "rename",
-          isAnchor ? STRENGTH.anchorRename : STRENGTH.rename,
-          [e.url],
-        );
+        if (e.kind === "anchor-rename") {
+          // label = old, link target = new: the edge joins those two, whoever
+          // owns the page (it may be a third party linking the subject).
+          const renamed = handleNodes.get(normalizeHandleKey(e.anchorTarget ?? ownerRaw)) ?? owner;
+          addEdge(renamed.id, target.id, "anchor-rename", STRENGTH.anchorRename, [e.url]);
+          continue;
+        }
+        // The anchor's label is also a plain mention of the target on the same
+        // page; that one observation already produced the anchor edge.
+        const anchored = entries.some((a) => a.kind === "anchor-rename" && a.url === e.url && a.target === e.target);
+        if (!anchored) addEdge(owner.id, target.id, "rename", STRENGTH.rename, [e.url]);
       }
     }
   }
@@ -464,7 +500,7 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
   // over every spelling variant; URL fragments (/handle/i/x) never match.
   if (input.corpusTexts?.length) {
     for (const [key, node] of handleNodes) {
-      if (key === auditedKey || key.length < 4 || isReservedKey(key)) continue;
+      if (key === auditedKey || key.length < 4 || isSeededHandleWord(key)) continue;
       const variants = buckets.get(key)?.variants ?? [node.value];
       const evidence: string[] = [];
       for (const item of input.corpusTexts) {
@@ -483,12 +519,54 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
     }
   }
 
+  // An email in the subject's own posts is the same kind of self-disclosure:
+  // tie it to the audited identity. Vendor/noreply mailboxes never.
+  for (const [lc, permalinks] of corpusEmailPermalinks) {
+    if (isRoleMailbox(lc) || isContentlessEmail(lc)) continue;
+    addEdge(ensureEmailNode(lc).id, auditedId, "disclosure", STRENGTH.disclosure, permalinks);
+  }
+
+  // A GitHub/X account whose login IS the audited username shares its node,
+  // so its profile fields would fuse into the subject on string equality
+  // alone. When nothing else ties the account to the subject (no bridge at
+  // the audited node, no corpus link to the account or its emails) and the
+  // subject's posts contradict its location/company, it gets its own node:
+  // a separate person.
+  const auditedBridged = [...edgeMap.values()].some(
+    (e) => (e.kind === "rename" || e.kind === "anchor-rename") && (e.from === auditedId || e.to === auditedId),
+  );
+  const splitEmails = new Set<string>();
+  const profileNode = (
+    platform: string,
+    login: string,
+    url: string,
+    profile: { location?: string; company?: string },
+    emails: string[],
+  ): IdentityGraphNode | undefined => {
+    const key = normalizeHandleKey(login);
+    if (key !== auditedKey) return handleNodes.get(key);
+    const linked =
+      auditedBridged ||
+      (input.corpusIdentifiers?.socialHandles ?? []).some(
+        (h) => h.platform === platform && normalizeHandleKey(h.handle) === key,
+      ) ||
+      emails.some((e) => corpusEmailPermalinks.has(e.toLowerCase()));
+    if (linked || !profileContradictsCorpus(profile, input.corpusTexts ?? [])) return handleNodes.get(key);
+    const audited = handleNodes.get(key);
+    if (audited) audited.platforms = audited.platforms.filter((p) => p !== platform);
+    for (const e of emails) splitEmails.add(e.toLowerCase());
+    const id = `handle:${key}@${platform}`;
+    const node = handleNodes.get(id) ?? { id, kind: "handle", value: login, platforms: [platform], sources: [url] };
+    handleNodes.set(id, node);
+    return node;
+  };
+
   // 5d. GitHub profile/commit fields: login → email (0.9), name (0.8), site (0.7).
   for (const gh of input.gitHub?.identities ?? []) {
-    const loginNode = handleNodes.get(normalizeHandleKey(gh.login));
+    const ghEmails = [gh.email ?? "", ...gh.commitAuthors.map((a) => a.email)].filter(Boolean);
+    const loginNode = profileNode("github", gh.login, gh.url, gh, ghEmails);
     if (!loginNode) continue;
-    const emails = new Set([gh.email ?? "", ...gh.commitAuthors.map((a) => a.email)].filter(Boolean));
-    for (const e of emails) {
+    for (const e of new Set(ghEmails)) {
       if (isContentlessEmail(e)) continue;
       addEdge(loginNode.id, ensureEmailNode(e).id, "email-of", STRENGTH.emailOf, [gh.url]);
     }
@@ -509,9 +587,9 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
   for (const res of input.twitter?.results ?? []) {
     const p = res.profile;
     if (!p) continue;
-    const node = handleNodes.get(normalizeHandleKey(p.screenName));
-    if (!node) continue;
     const profileUrl = `https://x.com/${p.screenName}`;
+    const node = profileNode("x", p.screenName, profileUrl, p, []);
+    if (!node) continue;
     if (p.name && looksLikeRealName(p.name, p.screenName)) {
       addEdge(node.id, ensureNameNode(p.name).id, "name-of", STRENGTH.nameOf, [profileUrl]);
     }
@@ -527,7 +605,8 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
   for (const [lc] of emailNodes) {
     const localKey = normalizeHandleKey(lc.split("@")[0] ?? "");
     const handleNode = localKey ? handleNodes.get(localKey) : undefined;
-    if (handleNode) {
+    // A split namesake's email already hangs off its own node at 0.9.
+    if (handleNode && !(handleNode.id === auditedId && splitEmails.has(lc))) {
       addEdge(handleNode.id, `email:${lc}`, "email-of", STRENGTH.emailLocalPart, [
         ...(emailProvenance.get(lc) ?? []).slice(0, 1),
       ]);

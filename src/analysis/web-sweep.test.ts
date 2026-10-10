@@ -57,6 +57,16 @@ describe("web-sweep scoping: snippets never feed extraction", () => {
 		expect(result.snowballSeeds ?? []).not.toContain("noise@noise.com");
 	});
 
+	test("role mailboxes count only on the personal site's own domain", async () => {
+		const result = await runDeterministicWebSweep("janedoe", () => {}, { maxRounds: 1, deps: {
+			search: async (query) => [{ query, title: "janedoe", url: "https://janedoe.dev", description: "janedoe" }],
+			followSite: async (url) => ({ url, text: "janedoe portfolio. Write to hello@janedoe.dev or raj@acme.com.\nFooter: support@vendor.com | abuse@vendor.com" }),
+			scrape: async (url) => ({ url, title: "", description: "", markdown: "", links: [] }),
+			redditAbout: async () => null,
+		} });
+		expect(result.identifiers.emails.sort()).toEqual(["hello@janedoe.dev", "raj@acme.com"]);
+	});
+
 	test("the scrape seam is actually exercised (pages read, not just indexed)", async () => {
 		const scrape = mock(scrapeImpl);
 		const search = mock(searchImpl);

@@ -41,6 +41,14 @@ describe("buildCorpusManifest", () => {
     expect(m.permalinks.has("/r/programming/comments/bbb/title")).toBe(true);
     expect(m.permalinks.has("/r/askreddit/comments/ccc/til/x/y")).toBe(true);
   });
+
+  test("post bodies (selftext) are scanned and can validate quotes", () => {
+    const post = { title: "Moving soon", selftext: "Leaving Pune for a job at Acme next month", permalink: "/r/pune/comments/ddd/moving/" };
+    const m = buildCorpusManifest([post]);
+    expect(extractDirectIdentifiers(buildCorpusManifest([{ ...post, selftext: "reach me at me@example.dev" }]).texts).emails).toEqual(["me@example.dev"]);
+    const sf = validateStructuredFindings(mkStructured([mkFinding("employer_or_school", [{ quote: "a job at Acme", permalink: post.permalink }])]), m);
+    expect(sf.findings[0].evidence).toHaveLength(1);
+  });
 });
 
 describe("validateStructuredFindings", () => {
@@ -101,6 +109,18 @@ describe("validateStructuredFindings", () => {
     const v = validateStructuredFindings(sf); // no manifest
     // malformed permalink dropped; the unverifiable quote is retained (cannot check)
     expect(v.findings[0].evidence.length).toBe(1);
+    expect(v.evidenceValidation?.unsupported).toBe(1);
+  });
+
+  test("an empty manifest (run holds no Reddit text) gives every citation zero weight", () => {
+    const sf = mkStructured([
+      mkFinding("location", [
+        { quote: "I moved to Hyderabad last year for work.", permalink: "https://reddit.com/r/hyderabad/comments/aaa/title/" },
+      ], "lives in Hyderabad"),
+    ]);
+    const v = validateStructuredFindings(sf, buildCorpusManifest([]));
+    expect(v.findings[0].claim).toBe("lives in Hyderabad");
+    expect(v.findings[0].evidence.length).toBe(0);
     expect(v.evidenceValidation?.unsupported).toBe(1);
   });
 

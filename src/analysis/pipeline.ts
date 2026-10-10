@@ -19,11 +19,11 @@ import { buildRuntimeTools } from "../runtime/tools.ts";
 import { mcpWebPreferred, mcpWebNote, webToolsAvailable } from "../runtime/providers/index.ts";
 import { ANALYST_SYSTEM_PROMPT, buildUserPrompt } from "../prompts.ts";
 import { runDeterministicWebSweep, renderWebSweepBlock, renderWebContextForPrompt, sweepCapable, rankHandles, type WebSweepResult } from "./web-sweep.ts";
-import { runGitHubPass, renderGitHubBlock, renderGitHubContextForPrompt, gitHubIdentifiers, type GitHubPassResult } from "./github-pass.ts";
+import { runGitHubPass, mergeGitHubPass, renderGitHubBlock, renderGitHubContextForPrompt, gitHubIdentifiers, type GitHubPassResult } from "./github-pass.ts";
 import { runTwitterPass, twitterAvailable, renderTwitterBlock, renderTwitterContextForPrompt, twitterIdentifiers, type TwitterPassResult } from "./twitter-pass.ts";
 import { extractDirectIdentifiers, renderDirectIdentifiersBlock, renderModelMentionedBlock } from "./extract.ts";
-import { extractStructuredFindings, renderStructuredFindings, validateStructuredFindings, type StructuredFindings } from "./findings.ts";
-import { computeCorroboration, renderCorroborationBlock, maxRisk, type CorroborationResult } from "./corroboration.ts";
+import { extractStructuredFindings, renderStructuredFindings, validateStructuredFindings, buildCorpusManifest, type StructuredFindings } from "./findings.ts";
+import { computeCorroboration, renderCorroborationBlock, checkCandidateHypothesis, renderCandidateHypothesisBlock, maxRisk, type CorroborationResult, type CandidateHypothesisCheck } from "./corroboration.ts";
 import { estimateUtcOffset, renderTimezoneBlock, renderTimezoneContextForPrompt, type TimezoneEstimate } from "./timezone.ts";
 import { renderSubAgentLeadsDigest } from "./leads-digest.ts";
 import { estimateAges, renderAgeBlock, type AgeEstimate } from "./age.ts";
@@ -62,6 +62,8 @@ export interface AuditResult {
 	structured?: StructuredFindings;
 	/** Deterministic cross-signal corroboration verdict (triangulation layer). */
 	corroboration?: CorroborationResult;
+	/** Candidate consistency check; never changes evidence weight. */
+	candidateCheck?: CandidateHypothesisCheck;
 	/** The de-overloaded verdict (exposure / attribution / evidence quality). */
 	verdict?: AuditVerdict;
 	/** The narrative "Executive Summary — Person Brief" paragraph, for quick display. */
@@ -103,24 +105,6 @@ export function extractReportBrief(content: string, structured?: StructuredFindi
 		grabAfterHeading(/(^|\n)#{1,6}\s*\d*\.?\s*IDENTITY RESOLUTION[^\n]*\n+/i);
 	if (!brief) brief = structured?.summary ?? "";
 	return stripMarkdown(brief);
-}
-
-/** Merge a secondary GitHub pass into the primary one (alt-lead loop closure). */
-function mergeGitHubPass(primary: GitHubPassResult | undefined, extra: GitHubPassResult): GitHubPassResult {
-	if (!primary) return extra;
-	const seen = new Set(primary.identities.map((i) => i.login.toLowerCase()));
-	const identities = [...primary.identities];
-	for (const id of extra.identities) {
-		const key = id.login.toLowerCase();
-		if (seen.has(key)) continue;
-		seen.add(key);
-		identities.push(id);
-	}
-	return {
-		queried: [...new Set([...primary.queried, ...extra.queried])],
-		identities,
-		rateLimited: primary.rateLimited || extra.rateLimited,
-	};
 }
 
 /** Merge a secondary web sweep (seeded on a Twitter alt lead) into the primary
@@ -414,12 +398,8 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 				...ranked.filter((r) => r.tier !== "single platform").map((r) => r.handle),
 			];
 			status(`🐙 GitHub identity pass over ${seeds.length} handle(s)...`);
+			// Context is rendered once, after the alt-lead and corpus re-probes merge in.
 			gitHub = await runGitHubPass(seeds, {}, (msg) => { status(msg); log(msg); });
-			const ghCtx = renderGitHubContextForPrompt(gitHub, username);
-			if (ghCtx) {
-				webContextText = `${webContextText}${ghCtx}`;
-				log(`[github-pass] Injecting ${gitHub.identities.length} GitHub identit(ies) into analysis as ground truth.`);
-			}
 		} catch (err: any) {
 			log(`[github-pass] Failed (continuing without GitHub leads): ${err?.message ?? err}`);
 		}
@@ -489,11 +469,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 				const extraGh = await runGitHubPass(altLeadHandles, {}, (msg) => { status(msg); log(msg); });
 				if (extraGh.identities.length > 0) {
 					gitHub = mergeGitHubPass(gitHub, extraGh);
-					const ghCtx = renderGitHubContextForPrompt(extraGh, username);
-					if (ghCtx) {
-						webContextText = `${webContextText}${ghCtx}`;
-						log(`[loop] GitHub pass over alt leads found ${extraGh.identities.length} identit(ies).`);
-					}
+					log(`[loop] GitHub pass over alt leads found ${extraGh.identities.length} identit(ies).`);
 				}
 			} catch (err: any) {
 				log(`[loop] Alt-lead GitHub pass failed (continuing): ${err?.message ?? err}`);
@@ -563,12 +539,60 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		}
 	}
 
+	status(`Preparing deep scan for u/${username}...`);
+	const local = await ensureLocalData(username, years, dataDir, log);
+
+	// Raw pre-filter item texts + regex identifiers from the subject's own posts,
+	// shared by the GitHub re-probe, both identity-graph builds and corroboration:
+	// a verbatim handle mention on Reddit is a reddit-domain source and a
+	// disclosure edge in the graph.
+	const corpusItems = local
+		? [
+			...local.posts.map((p: any) => ({ text: `${p?.title ?? ""} ${p?.selftext ?? ""}`.trim(), permalink: p?.permalink })),
+			...local.comments.map((c: any) => ({ text: c?.body ?? "", permalink: c?.permalink })),
+		]
+		: undefined;
+	const localIds = local
+		? extractDirectIdentifiers(buildCorpusManifest([...local.posts, ...local.comments]).texts, username)
+		: undefined;
+
+	// ── Corpus-disclosed GitHub handles (loop closure over the subject's own posts) ──
+	// The GitHub pass ran before the corpus existed, so a github.com/x link the
+	// subject posted on Reddit was never probed. Regex extraction is cheap, so
+	// probe the unqueried ones here — before the graph, digest and synthesis —
+	// so the LLM reasons about their profile + commit emails too. The live-agent
+	// path has no local corpus to extract from, so it skips this.
+	if (web && localIds) {
+		try {
+			const queried = new Set((gitHub?.queried ?? []).map((q) => q.toLowerCase()));
+			const corpusGhHandles = [...new Set(
+				localIds.socialHandles.filter((h) => h.platform === "github").map((h) => h.handle),
+			)].filter((h) => !queried.has(h.toLowerCase()));
+			if (corpusGhHandles.length > 0) {
+				log(`[github-pass] Probing corpus-disclosed GitHub handle(s): [${corpusGhHandles.join(", ")}]`);
+				gitHub = mergeGitHubPass(gitHub, await runGitHubPass(corpusGhHandles, {}, (msg) => { status(msg); log(msg); }));
+			}
+		} catch (err: any) {
+			log(`[github-pass] Corpus-handle pass failed (continuing): ${err?.message ?? err}`);
+		}
+	}
+
+	// GitHub ground truth, rendered once from the fully merged result (primary +
+	// alt-lead + corpus-disclosed probes).
+	if (gitHub) {
+		const ghCtx = renderGitHubContextForPrompt(gitHub, username);
+		if (ghCtx) {
+			webContextText = `${webContextText}${ghCtx}`;
+			log(`[github-pass] Injecting ${gitHub.identities.length} GitHub identit(ies) into analysis as ground truth.`);
+		}
+	}
+
 	// ── Identity graph, pre-synthesis build (namesake ground truth) ──
-	// Built from the deterministic passes only (no corpus yet): the synthesis
+	// Built from the deterministic passes plus the subject's own posts: the synthesis
 	// agent learns which handles fuse into the SUBJECT person and which are
 	// provably separate (namesakes) before it writes Identity Resolution.
 	try {
-		const preGraph = buildIdentityGraph({ username, webSweep, gitHub, twitter });
+		const preGraph = buildIdentityGraph({ username, webSweep, gitHub, twitter, corpusIdentifiers: localIds, corpusTexts: corpusItems });
 		const ctx = renderIdentityGraphContextForPrompt(preGraph, username);
 		if (ctx) {
 			webContextText = `${webContextText}${ctx}`;
@@ -592,9 +616,6 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	} catch (err: any) {
 		log(`[leads] Digest failed (continuing without): ${err?.message ?? err}`);
 	}
-
-	status(`Preparing deep scan for u/${username}...`);
-	const local = await ensureLocalData(username, years, dataDir, log);
 
 	// ── Deterministic posting-time timezone estimate (needs the corpus) ──
 	// Sleep-window fit over created_utc: the UTC offset whose local 01:00–07:00
@@ -677,7 +698,9 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		if (!structured) {
 			try {
 				structured = await extractStructuredFindings(content, corpusIdentifiers, username, log);
-				structured = validateStructuredFindings(structured); // shape-only — no corpus in standard path
+				// Live path: no local corpus, and reddit_search results carry no
+				// permalinks — an empty manifest gives unverifiable citations zero weight.
+				structured = validateStructuredFindings(structured, buildCorpusManifest([]));
 				if (structured) content = `${content}\n\n---\n${renderStructuredFindings(structured)}`;
 			} catch (err: any) {
 				log(`[findings] Structured extraction failed: ${err?.message ?? err}`);
@@ -725,15 +748,23 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		log(`[age] Deterministic age pass failed (continuing): ${err?.message ?? err}`);
 	}
 
-	// Raw pre-filter item texts shared by corroboration + the identity graph:
-	// a verbatim word-boundary handle mention on Reddit is a reddit-domain
-	// source for that handle's cluster and a disclosure edge in the graph.
-	const corpusItems = local
-		? [
-			...local.posts.map((p: any) => ({ text: `${p?.title ?? ""} ${p?.selftext ?? ""}`.trim(), permalink: p?.permalink })),
-			...local.comments.map((c: any) => ({ text: c?.body ?? "", permalink: c?.permalink })),
-		]
-		: undefined;
+	// ── Identity graph, full build (post-corpus: disclosure edges included) ──
+	// Corroboration needs the final person ownership before clustering, including
+	// handles the subject disclosed in the corpus. Rendering stays after scoring.
+	try {
+		identityGraph = buildIdentityGraph({
+			username,
+			webSweep,
+			gitHub,
+			twitter,
+			corpusIdentifiers,
+			corpusTexts: corpusItems,
+		});
+		const subject = identityGraph.persons.find((p) => p.isSubject);
+		log(`[graph] ${identityGraph.persons.length} person entit(ies); subject confidence=${subject?.confidence ?? "n/a"} with ${subject?.handleNodes.length ?? 0} handle(s).`);
+	} catch (err: any) {
+		log(`[graph] Identity graph failed (continuing): ${err?.message ?? err}`);
+	}
 
 	// ── Cross-signal corroboration (deterministic fusion over ALL sources) ──
 	// Runs last. Crucially it receives the CORPUS-ONLY direct set plus the web
@@ -743,6 +774,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	try {
 		corroboration = computeCorroboration({
 			username,
+			identityGraph,
 			structured,
 			directIdentifiers: corpusIdentifiers,
 			webSweep,
@@ -768,25 +800,20 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		log(`[corroboration] Failed (continuing without corroboration layer): ${err?.message ?? err}`);
 	}
 
-	// ── Identity graph, full build (post-corpus: disclosure edges included) ──
-	// Fuses rename/cluster/drift/disclosure/email/name edges into person
-	// entities: the subject person (handles + emails + names + confidence) and
-	// the namesake candidates the graph says are NOT the subject.
-	try {
-		identityGraph = buildIdentityGraph({
-			username,
-			webSweep,
-			gitHub,
-			twitter,
-			corpusIdentifiers,
-			corpusTexts: corpusItems,
-		});
-		const block = renderIdentityGraphBlock(identityGraph, username);
-		if (block) content = `${content}\n\n---\n${block}`;
-		const subject = identityGraph.persons.find((p) => p.isSubject);
-		log(`[graph] ${identityGraph.persons.length} person entit(ies); subject confidence=${subject?.confidence ?? "n/a"} with ${subject?.handleNodes.length ?? 0} handle(s).`);
-	} catch (err: any) {
-		log(`[graph] Identity graph failed (continuing): ${err?.message ?? err}`);
+	const candidateCheck = checkCandidateHypothesis(candidate, corroboration);
+	if (candidateCheck) {
+		content = `${content}\n\n---\n${renderCandidateHypothesisBlock(candidateCheck)}`;
+		log(`[candidate] ${candidateCheck.name}: ${candidateCheck.status}.`);
+	}
+
+	// Preserve the report's section order without rebuilding the graph.
+	if (identityGraph) {
+		try {
+			const block = renderIdentityGraphBlock(identityGraph, username);
+			if (block) content = `${content}\n\n---\n${block}`;
+		} catch (err: any) {
+			log(`[graph] Identity graph rendering failed (continuing): ${err?.message ?? err}`);
+		}
 	}
 
 	const json = {
@@ -800,6 +827,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		archivePass,
 		identityGraph,
 		candidate: candidate?.name,
+		candidateCheck,
 		identifierCollections,
 		directIdentifiers,
 		modelMentionedIdentifiers,
@@ -820,6 +848,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		identifierCollections,
 		structured,
 		corroboration,
+		candidateCheck,
 		verdict: corroboration?.verdict,
 		brief,
 		json,

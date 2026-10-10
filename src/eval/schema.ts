@@ -16,7 +16,8 @@
 import type { FirecrawlSearchResult, ScrapeResult } from "../runtime/firecrawl.ts";
 import type { WebSweepDeps } from "../analysis/web-sweep.ts";
 import type { GitHubIdentity } from "../analysis/github-pass.ts";
-import type { DirectIdentifiers } from "../analysis/extract.ts";
+import { normalizeHandleKey, type DirectIdentifiers } from "../analysis/extract.ts";
+import type { IdentityGraph } from "../analysis/identity-graph.ts";
 import type { CorroborationResult } from "../analysis/corroboration.ts";
 import type { VerdictLevel } from "../analysis/evidence.ts";
 
@@ -36,7 +37,8 @@ export type FixtureCategory =
   | "no-identity"
   | "partial-archive"
   | "deleted-content"
-  | "nested-location";
+  | "nested-location"
+  | "anchor-rename";
 
 export const ALL_CATEGORIES: FixtureCategory[] = [
   "bridge",
@@ -51,6 +53,7 @@ export const ALL_CATEGORIES: FixtureCategory[] = [
   "partial-archive",
   "deleted-content",
   "nested-location",
+  "anchor-rename",
 ];
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -242,6 +245,15 @@ export interface EvalMetrics {
   /** Contradiction detection accuracy. */
   contradictionCorrect: boolean;
 
+  /** Fusion: of the subject's true identifiers, the fraction the identity
+   *  graph links into the subject person (1 when there are none). */
+  fusionRecall: number;
+  /** Known non-identifiers wrongly fused into the subject person. */
+  fusionFalseLinks: string[];
+  /** Corroboration's overallRisk vs the fixture's expectedRisk. */
+  actualRisk: VerdictLevel;
+  riskCorrect: boolean;
+
   /** Detailed lists for inspection. */
   truePositives: string[];
   falsePositives: string[];
@@ -259,6 +271,10 @@ export interface AggregateMetrics {
   meanCandidateLinkPrecision: number;
   attributionTop1Rate: number;
   contradictionAccuracy: number;
+  meanFusionRecall: number;
+  /** Fixtures with at least one non-identifier fused into the subject. */
+  fusionFalseLinkCount: number;
+  riskAccuracy: number;
 
   perFixture: EvalMetrics[];
   failures: Array<{ fixtureId: string; error: string }>;
@@ -268,7 +284,11 @@ export interface AggregateMetrics {
  * Scoring helpers (pure)
  * ──────────────────────────────────────────────────────────────────────── */
 
-/** Compute precision/recall/F1 from true/false positive/negative sets. */
+/**
+ * Compute precision/recall/F1 from true/false positive/negative sets.
+ * Nothing to find and nothing found is a perfect score, not zero — otherwise
+ * fixtures with empty ground truth drag every mean toward 0.
+ */
 export function computePRF1(
   tp: string[],
   fp: string[],
@@ -277,6 +297,7 @@ export function computePRF1(
   const tpCount = tp.length;
   const fpCount = fp.length;
   const fnCount = fn.length;
+  if (tpCount + fpCount + fnCount === 0) return { precision: 1, recall: 1, f1: 1 };
   const precision = tpCount + fpCount > 0 ? tpCount / (tpCount + fpCount) : 0;
   const recall = tpCount + fnCount > 0 ? tpCount / (tpCount + fnCount) : 0;
   const f1 = precision + recall > 0 ? (2 * precision * recall) / (precision + recall) : 0;
@@ -430,6 +451,31 @@ export function scoreContradictions(
   return { correct: hasContradiction === shouldHave };
 }
 
+/**
+ * Score identity fusion — the property identifier lists can't measure.
+ * Finding a handle is extraction; linking it to the audited username's
+ * person is fusion. Handles compare on normalized key (graph nodes are
+ * platform-agnostic); the audited username itself is excluded as trivial.
+ */
+export function scoreFusion(
+  graph: IdentityGraph | undefined,
+  groundTruth: FixtureGroundTruth,
+  username: string,
+): { recall: number; falseLinks: string[] } {
+  const subject = graph?.persons.find((p) => p.isSubject);
+  const linked = new Set([...(subject?.handleNodes ?? []), ...(subject?.emailNodes ?? [])]);
+  const nodeIds = (ids: FixtureGroundTruth["identifiers"]) => [...new Set([
+    ...ids.handles.map((h) => `handle:${normalizeHandleKey(h.handle)}`),
+    ...ids.emails.map((e) => `email:${e.toLowerCase()}`),
+  ])].filter((id) => id !== `handle:${normalizeHandleKey(username)}`);
+  const truth = nodeIds(groundTruth.identifiers);
+  const found = truth.filter((id) => linked.has(id)).length;
+  return {
+    recall: truth.length ? found / truth.length : 1,
+    falseLinks: nodeIds(groundTruth.nonIdentifiers).filter((id) => linked.has(id)),
+  };
+}
+
 /** Aggregate per-fixture metrics into an AggregateMetrics report. */
 export function aggregateMetrics(perFixture: EvalMetrics[]): AggregateMetrics {
   const failures = perFixture.filter((m) => m.identifierF1 < 0);
@@ -448,6 +494,9 @@ export function aggregateMetrics(perFixture: EvalMetrics[]): AggregateMetrics {
     meanCandidateLinkPrecision: mean(valid.map((m) => m.candidateLinkPrecision)),
     attributionTop1Rate: valid.filter((m) => m.attributionTop1Correct).length / Math.max(1, valid.length),
     contradictionAccuracy: valid.filter((m) => m.contradictionCorrect).length / Math.max(1, valid.length),
+    meanFusionRecall: mean(valid.map((m) => m.fusionRecall)),
+    fusionFalseLinkCount: valid.filter((m) => m.fusionFalseLinks.length > 0).length,
+    riskAccuracy: valid.filter((m) => m.riskCorrect).length / Math.max(1, valid.length),
     perFixture,
     failures: failures.map((m) => ({ fixtureId: m.fixtureId, error: "computation failed" })),
   };

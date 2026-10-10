@@ -71,9 +71,10 @@ const FIXTURES: EvalFixture[] = [
         { owner: "fixturenew", mentions: "fixtureveil", url: "https://github.com/fixturenew" },
       ],
       nonIdentifiers: { emails: [], handles: [] },
-      subjectName: "fixturenew",
+      // No real name here — the profile's "name" just repeats the login. The
+      // bridge + email floor exposure at medium; high needs a real name too.
       subjectGitHubLogins: ["fixturenew"],
-      expectedRisk: "high",
+      expectedRisk: "medium",
     },
   },
 
@@ -106,6 +107,10 @@ const FIXTURES: EvalFixture[] = [
         }),
       },
       githubCommits: { "jhacker/coffee-app": [ghCommit("James Hacker", "jhacker@linecorp.com", "jhacker")] },
+      // The subject's own residence contradicts the GitHub profile's Tokyo.
+      redditHistory: [
+        { body: "I live in Manchester, any good curry spots near the Northern Quarter?", title: "", permalink: "/r/manchester/comments/u1/title/", subreddit: "manchester", created_utc: 1700000000 },
+      ],
     },
     groundTruth: {
       identifiers: { emails: [], handles: [] },
@@ -193,6 +198,10 @@ const FIXTURES: EvalFixture[] = [
           ghCommit("dependabot[bot]", "support@github.com", "dependabot"),      // bot ✗
         ],
       },
+      // Consistent with the GitHub profile's location: no contradiction.
+      redditHistory: [
+        { body: "I live in San Francisco and the rent is brutal.", title: "", permalink: "/r/sanfrancisco/comments/s1/title/", subreddit: "sanfrancisco", created_utc: 1700000000 },
+      ],
     },
     groundTruth: {
       identifiers: {
@@ -379,7 +388,8 @@ const FIXTURES: EvalFixture[] = [
       nonIdentifiers: { emails: [], handles: [] },
       subjectLocation: "Unknown",
       expectContradiction: true,
-      expectedRisk: "medium",
+      // Contradictions downgrade the risk ladder by design.
+      expectedRisk: "low",
     },
   },
 
@@ -514,7 +524,7 @@ const FIXTURES: EvalFixture[] = [
       },
       scrapedPages: {
         "https://github.com/hyd-dev": scrapePage("https://github.com/hyd-dev",
-          "## hyd-dev\nDeveloper based in Uppal, Hyderabad, India.\n"),
+          "## hyd-dev\nDeveloper based in Uppal, Hyderabad, India.\nReddit: hyd_resident\n"),
       },
       githubProfiles: {
         "hyd-dev": ghUser("hyd-dev", { name: "Hyd Dev", location: "Uppal, Hyderabad, India" }),
@@ -532,10 +542,77 @@ const FIXTURES: EvalFixture[] = [
         emails: [],
         handles: [{ platform: "github", handle: "hyd-dev" }],
       },
-      bridgeEdges: [],
+      bridgeEdges: [
+        { owner: "hyd-dev", mentions: "hyd_resident", url: "https://github.com/hyd-dev" },
+      ],
       nonIdentifiers: { emails: [], handles: [] },
       subjectLocation: "Hyderabad",
       expectedRisk: "medium",
+    },
+  },
+
+  /* ═══════════════════════════════════════════════════════════════════════
+   * 13. ANCHOR-RENAME ON A THIRD-PARTY PAGE
+   *     A friend's GitHub README links `[quietfox](https://x.com/loudfox)`:
+   *     label = old handle, target = new. The renamed identity is loudfox;
+   *     the page owner is just someone linking the subject.
+   * ═══════════════════════════════════════════════════════════════════════ */
+  {
+    id: "anchor-rename-1",
+    description: "A third party's GitHub profile links the audited handle's label to a different X account. Direction is unambiguous: loudfox is the subject's current identity, the page owner is not the subject.",
+    version: 1,
+    categories: ["bridge", "anchor-rename"],
+    inputs: {
+      username: "quietfox",
+      searchResults: {
+        '"quietfox" github': [
+          searchHit('"quietfox" github', "marta-k", "https://github.com/marta-k", "marta-k — talks I liked: quietfox"),
+        ],
+      },
+      scrapedPages: {
+        "https://github.com/marta-k": scrapePage("https://github.com/marta-k",
+          "## marta-k\nTalks I liked:\n- [quietfox](https://x.com/loudfox) — fuzzing parsers"),
+      },
+      githubProfiles: {},
+      githubCommits: {},
+    },
+    groundTruth: {
+      identifiers: { emails: [], handles: [{ platform: "x", handle: "loudfox" }] },
+      bridgeEdges: [
+        { owner: "loudfox", mentions: "quietfox", url: "https://github.com/marta-k" },
+      ],
+      nonIdentifiers: { emails: [], handles: [{ platform: "github", handle: "marta-k" }] },
+    },
+  },
+
+  /* ═══════════════════════════════════════════════════════════════════════
+   * 14. ROLE MAILBOX ON THE SUBJECT'S OWN DOMAIN
+   *     hello@ on the subject's own site is theirs; support@ on a vendor
+   *     domain on the same page is not.
+   * ═══════════════════════════════════════════════════════════════════════ */
+  {
+    id: "own-domain-mailbox-1",
+    description: "The subject's personal site lists hello@wrencodes.dev (role local part, own domain → identifier) and a vendor's support@vendor.com in the footer (→ not an identifier).",
+    version: 1,
+    categories: ["vendor-email"],
+    inputs: {
+      username: "wren_codes",
+      searchResults: {
+        '"wren_codes" portfolio': [
+          searchHit('"wren_codes" portfolio', "wren_codes", "https://wrencodes.dev", "Portfolio — wren_codes"),
+        ],
+      },
+      scrapedPages: {
+        "https://wrencodes.dev": scrapePage("https://wrencodes.dev",
+          "# wren_codes\nSay hi: hello@wrencodes.dev\n\n---\nHosting by Vendor — support@vendor.com"),
+      },
+      githubProfiles: {},
+      githubCommits: {},
+    },
+    groundTruth: {
+      identifiers: { emails: ["hello@wrencodes.dev"], handles: [] },
+      bridgeEdges: [],
+      nonIdentifiers: { emails: ["support@vendor.com"], handles: [] },
     },
   },
 ];

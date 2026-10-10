@@ -211,9 +211,10 @@ function extractMentions(text: string, username: string, max = 3): string[] {
   // Match username as a token: preceded by non-alphanumeric-or-@ (start, space,
   // @, quotes, brackets, slash, pipe) and not followed by alphanumeric. This
   // rejects `/fixtureveil/i/`, `?id=fixtureveilx`, etc., but keeps `@fixtureveil`, `[fixtureveil]`,
-  // `( fixtureveil )`, `"fixtureveil"`, ` fixtureveil `.
+  // `( fixtureveil )`, `"fixtureveil"`, ` fixtureveil `. Hyphens join handle tokens, so
+  // `fixtureveil-dev` (a different handle) never mentions `fixtureveil`.
   const escaped = username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`(^|[^\\w@])(${escaped})(?![\\w])`, "gi");
+  const re = new RegExp(`(^|[^\\w@-])(${escaped})(?![\\w-])`, "gi");
   const out: string[] = [];
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null && out.length < max) {
@@ -229,7 +230,7 @@ function extractMentions(text: string, username: string, max = 3): string[] {
 /** Word-boundary mention test over a link's VISIBLE LABEL only. */
 function mentionInLabel(label: string, handle: string): boolean {
   const escaped = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(^|[^\\w@])(${escaped})(?![\\w])`, "i").test(label);
+  return new RegExp(`(^|[^\\w@-])(${escaped})(?![\\w-])`, "i").test(label);
 }
 
 /**
@@ -398,14 +399,20 @@ const RESERVED_SEED_WORDS = new Set([
  * noreply@ … belong to the SITE we scraped, not to the subject). */
 const VENDOR_EMAIL_LOCALPARTS = /^(abuse|dmca|noreply|no-?reply|donotreply|info|support|help|privacy|legal|partners|contact|sales|admin|administrator|webmaster|security|postmaster|marketing|press|media|team|hello|hi|office|mail|billing|trust|safety|copyright|compliance)$/i;
 
-function isSeededHandleWord(handle: string): boolean {
+export function isSeededHandleWord(handle: string): boolean {
   const norm = normalizeHandleKey(handle);
   return norm.length < 3 || RESERVED_SEED_WORDS.has(norm);
 }
 
+/** Role/system mailbox (abuse@, info@, noreply@ …): never the subject's
+ *  identity unless it sits on their own site's domain. */
+export function isRoleMailbox(email: string): boolean {
+  return VENDOR_EMAIL_LOCALPARTS.test(email.split("@")[0] ?? "");
+}
+
+/** Seed filter: role mailboxes plus very short local parts (too generic to search). */
 function isVendorEmail(email: string): boolean {
-  const local = email.split("@")[0] ?? "";
-  return local.length < 4 || VENDOR_EMAIL_LOCALPARTS.test(local);
+  return (email.split("@")[0] ?? "").length < 4 || isRoleMailbox(email);
 }
 
 /**
@@ -992,7 +999,16 @@ export async function runDeterministicWebSweep(
   }
 
   // ── Final extraction with per-source attribution (scraped pages only) ──
-  const identifiers = extractDirectIdentifiers(scrapedPages.map((p) => p.text), username);
+  const extracted = extractDirectIdentifiers(scrapedPages.map((p) => p.text), username);
+  // A role mailbox (info@, support@, abuse@ …) is the site owner's only when
+  // it sits on the personal page's own domain (hello@janedoe.dev on
+  // janedoe.dev); anywhere else it is a vendor's or a platform's.
+  const hostOf = (url: string) => { try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; } };
+  const ownSiteMailbox = (email: string) => scrapedPages.some((p) => {
+    const host = hostOf(p.source);
+    return host === email.split("@")[1] && !BIG_PLATFORM_RE.test(host) && extractEmails(p.text).includes(email);
+  });
+  const identifiers = { ...extracted, emails: extracted.emails.filter((e) => !isRoleMailbox(e) || ownSiteMailbox(e)) };
   const identifierSources = attributeSources(scrapedPages, identifiers);
 
   const candidates = [...candidateMap.values(), ...chaseQueue];

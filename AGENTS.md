@@ -55,7 +55,8 @@ highest-value catch.
   strongest attribution lead, and the highest-priority search seed. Handle
   tiers: `bridge` > `cross-platform cluster` > `username match` > `single`.
   Mention detection is word-boundary token matching, never raw substring, so
-  URL fragments (`/handle/i/...`) can't false-positive. Every bridge carries a
+  URL fragments (`/handle/i/...`) can't false-positive; hyphens count as
+  handle characters, so `john-dev` never mentions `john`. Every bridge carries a
   deterministic **confidence** — anchor-rename 1.0 > own link-aggregator page
   0.9 > own platform profile 0.8 > third-party page 0.5, +0.2 for a
   **reciprocal** pair (A's page mentions B *and* B's mentions A) — and a
@@ -75,7 +76,12 @@ highest-value catch.
   authors), `twitter-pass.ts` (profile/follow-graph reads), `findings.ts`
   (JSON re-projection), `corroboration.ts` (fusion across source domains;
   the corpus-mention join counts a verbatim Reddit handle disclosure as a
-  reddit-domain source, and locations merge by containment),
+  reddit-domain source, and locations merge by containment within a person;
+  graph-known namesakes never affect the subject's score/verdict, a subject
+  email local-part join adds +1 confidence without another source, and a
+  rename / anchor-rename / disclosure edge to the audited handle floors
+  `overallRisk` at medium — high with a real name and email — without adding
+  sources),
   `identity-graph.ts` (person-level fusion; splits namesakes from the
   subject).
   **Deterministic before LLM**: when a signal can be captured by regex, scan,
@@ -88,12 +94,23 @@ highest-value catch.
   three domain sub-agents receive the compact `leads-digest.ts` digest of the
   same passes.
 - **Provenance** — every identifier is tagged with the URLs it was seen on.
-  A value without provenance is a lead, not evidence.
+  A value without provenance is a lead, not evidence. Corroboration counts
+  one originating document (`canonicalSourceUrl`) once per signal, not one
+  vote per collector.
+- **Account verification** — the findings JSON carries CONFIRMED / LIKELY /
+  POSSIBLE / REJECTED labels. Labels only constrain corroboration, never add
+  a source: POSSIBLE and LIKELY cap account confidence, and REJECTED drops an
+  account (and fields read off its profile) unless the identity graph says
+  the subject owns it.
 - **Snowball** — the sweep's expansion pattern: round 1 seeds on the audited
   username; round 2 re-seeds with round-1 discoveries (bridge owners first,
   then cluster handles, non-vendor emails, drift variants, custom email
   domains). Handle B found via handle A is usually the *current* identity —
   searching it beats re-searching the decayed one.
+- **Role mailboxes** — `info@`, `support@`, `abuse@` … (`isRoleMailbox`) are
+  identifiers only on the personal site's own domain (`hello@jane.dev` on
+  jane.dev); elsewhere they belong to the vendor or platform. Emails in the
+  subject's own posts join the subject via a `disclosure` edge.
 - **Seed hygiene** — platform plumbing (`github`, `download`,
   `trending_repos`, …) and vendor mailboxes (`abuse@`, `noreply@`, …) must
   never become search seeds or bridge mention targets: a seed named `github`
@@ -115,7 +132,10 @@ highest-value catch.
   name-of) into **person entities**. The entity containing the audited
   username plus its bridge owners is the *subject person*; every other
   multi-platform entity is a **namesake** — same string, provably a different
-  person. Synthesis is instructed to never attribute namesake activity to
+  person. A GitHub/X account whose login equals the audited username is split
+  off (`handle:<key>@<platform>`) when nothing links it to the subject and the
+  subject's posts contradict its location/company. Profile "names" must pass
+  `nameLooksReal` (2+ capitalized tokens) to count as real names. Synthesis is instructed to never attribute namesake activity to
   the subject, and the report carries the graph as an `## Identity Graph`
   block. Existence probes and archive snapshots are *leads* in the same
   spirit: existence ≠ same person.
@@ -204,16 +224,17 @@ with the sweep's ranked handles; Firecrawl-independent) → optional Twitter
 pass (`--twitter`, Firecrawl-independent) → alt-lead loop closure (Twitter
 alt-account candidates re-probed through the GitHub pass + a single-round
 re-sweep, merged back into the primary results) → existence probes + Wayback
-archive pass over the top-tier handles → pre-synthesis identity-graph build
-(namesake ground truth) → ensure local JSONL via Arctic Shift (live
-tool-driven agent as fallback when nothing downloads) → timezone fit over the
+archive pass over the top-tier handles → ensure local JSONL via Arctic Shift
+→ GitHub re-probe of handles the subject posted on Reddit → pre-synthesis
+identity-graph build over passes + corpus (namesake ground truth) → live
+tool-driven agent as fallback when nothing downloaded → timezone fit over the
 corpus → heuristic filter → 3 domain sub-agents in parallel (each also
 receives the compact leads digest) → synthesis agent (all deterministic leads
 injected as ground truth; web tools when available) → corpus + model-mentioned
 identifier extraction → structured-findings JSON pass → deterministic age
-estimate over the report's own claims → report → **corroboration LAST**
-(fuses every domain, reconciles risk, emits the verdict) → full identity
-graph (disclosure edges included) rendered into the report.
+estimate over the report's own claims → full identity graph (disclosure edges
+included) → **corroboration LAST** (fuses every domain within person ownership,
+reconciles risk, emits the verdict) → identity graph rendered into the report.
 
 Deterministic passes run *before* analysis so the LLM reasons about the leads
 as ground truth instead of re-discovering them non-deterministically every
@@ -246,6 +267,63 @@ run. Keep that order.
   and `bun test` passes (the suite includes the offline eval regression).
   Adding an eval fixture? Bump the fixture-count assertion in
   `src/eval/eval.test.ts`.
+
+## Simplicity (anti-slop rules)
+
+Two past rounds were cut back hard: ~1,150 lines of snapshot plumbing
+(replaced by a URL normalizer), then a lead-lookup tool that only echoed the
+prompt. Don't repeat them:
+
+- **Smallest mechanism that kills the failure mode.** Before adding a type,
+  field or pipeline stage, ask whether a pure function over data we already
+  hold does the job (`canonicalSourceUrl` replaced a content-hashed
+  observation system for "count one page once").
+- **No speculative infrastructure.** Build for the current ROADMAP item, not
+  a later one. "We'll need hashes for the leak diff someday" is not a reason
+  to thread them through every collector today.
+- **Don't thread a new concept through every module.** If a feature needs
+  changes in firecrawl, site-follower, web-sweep, github-pass, twitter-pass
+  *and* download, the design is wrong. Keep it local to the consumer
+  (usually `corroboration.ts`) and the one stage that produces the input.
+- **One code path.** No `if (newThing) { … } else { /* legacy */ }` forks.
+  Migrate the callers and tests instead of keeping both.
+- **Validate once, at the boundary.** Never re-run a validator downstream
+  and then patch its stats back. Pass the validated value along.
+- **Model output that only constrains needs no proof machinery.** If an LLM
+  label can only *lower* confidence (POSSIBLE / LIKELY caps, REJECTED
+  drops), store it as plain fields. Citation/validation schemes are only for
+  outputs that *add* weight.
+- **Don't bloat prompts or report JSON.** No raw corpora, raw page bodies or
+  hash IDs pasted into prompts or saved into reports.
+- **No duplicated logic.** Don't re-implement a filter inline to recover
+  something the first call threw away. Change the first call to return it.
+  Don't copy a "module-private" helper into another file either: export it.
+  Copies drift, and drifted seed hygiene is the fake-bridge bug.
+- **Tests pin behaviour, not plumbing.** Assert on corroboration outcomes
+  (sources, confidence, score), not on hashes, timestamps or internal record
+  shapes.
+- **No second channel for data the model already has.** If a value is
+  injected into the prompt as ground truth, don't also expose it through a
+  tool, a digest *and* a report block. A new tool must give the model
+  something it can't already see: new data or a new action.
+- **Don't add tools to a tool-free path casually.** The claude-code MCP
+  synthesis path runs no app tools; one zero-arg tool turns it into a
+  text-ReAct loop (cold starts, the narration failure mode). Only do that
+  for a real capability.
+- **Read-only checks stay small.** A diagnostic that "never changes the
+  score" (e.g. the `--subject-name` check) gets one status and the evidence
+  for it. No side-channel "supporting context" lists that don't affect the
+  status.
+- **Implement what the ROADMAP item asks.** If the cheap version doesn't do
+  what the item names (e.g. "native MCP toolset"), leave the item open.
+  Don't ship a lookalike and mark it done.
+- **Test fixtures carry only what the assertion needs.** No extra findings
+  or profile fields "for realism".
+- **Comments say why, briefly.** No narration of rejected alternatives, no
+  "legacy/compat" notes for code paths nobody calls.
+- **Size check before finishing:** read `git diff --stat`. If the line count
+  is out of proportion to the ROADMAP item, cut it down before calling the
+  change done.
 
 ## Environment
 
@@ -313,8 +391,11 @@ consolidation accounts: 20–40 min (the `claude -p` cold-start dominates);
 7. **One observation counts once.** Identifiers are kept separated by source
    domain (`IdentifierCollections`: corpus / web / github / twitter /
    modelMentioned) and merged only for display; corroboration consumes the
-   separated collections. Merging them before `computeCorroboration`
-   resurrects the double-count bug. Model-mentioned identifiers are
+   separated collections. A scrape and API read of
+   one GitHub profile count as one GitHub document. Regex extraction, a corpus
+   mention and a finding citing one Reddit item count as one Reddit document.
+   Merging collections before `computeCorroboration` resurrects the double-count
+   bug. Model-mentioned identifiers are
    quarantined as unverified — they never count as an independent source.
 8. **A flaky provider must never abort a run.** `claude -p` has no
    `response_format: json_object`, so `findings.ts` carries

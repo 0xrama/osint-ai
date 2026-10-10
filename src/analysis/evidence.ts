@@ -29,8 +29,8 @@
  *
  * Milestone 1 introduces these types and the lineage discipline that kills the
  * double-count / model-contamination / unvalidated-evidence failure modes.
- * Milestone 2 will attach full content hashes + run manifests for replayable
- * artifacts on top of the same shapes.
+ * `canonicalSourceUrl` is the document identity corroboration dedupes on: one
+ * originating page counts once no matter how many collectors read it.
  */
 
 import type { DirectIdentifiers } from "./extract.ts";
@@ -76,6 +76,30 @@ export interface EvidenceObservation {
 	stage: EvidenceStage;
 	status: EvidenceStatus;
 	parentEvidenceIds: string[];
+}
+
+/** Canonical originating document so two collectors reading one page count
+ * once. Case-folds paths only on platforms with case-insensitive handles;
+ * personal-site paths and meaningful query params are preserved. */
+export function canonicalSourceUrl(raw: string): string {
+	try {
+		const u = new URL(raw.startsWith("/r/") ? `https://reddit.com${raw}` : raw);
+		if (!/^https?:$/.test(u.protocol)) return "";
+		u.protocol = "https:";
+		u.hostname = u.hostname.toLowerCase().replace(/^www\./, "");
+		if (u.hostname === "twitter.com") u.hostname = "x.com";
+		if (/^(old|np)\.reddit\.com$/.test(u.hostname)) u.hostname = "reddit.com";
+		if (/^(github\.com|x\.com|reddit\.com)$/.test(u.hostname)) u.pathname = u.pathname.toLowerCase();
+		u.pathname = u.pathname.replace(/\/+$/, "") || "/";
+		u.hash = "";
+		for (const key of [...u.searchParams.keys()]) {
+			if (/^(utm_.+|fbclid|gclid|ref|ref_source)$/i.test(key)) u.searchParams.delete(key);
+		}
+		u.searchParams.sort();
+		return u.toString().replace(/\/$/, "");
+	} catch {
+		return "";
+	}
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -221,6 +245,8 @@ export interface VerdictInput {
 		domainCount: number;
 		corroborating: boolean;
 		contradictions?: string[];
+		/** Account linkage labels constrain attribution, not source counts. */
+		accountStatus?: string;
 	}>;
 	contradictionStrings: string[];
 	/** optional structured-evidence validation stats. */
@@ -256,13 +282,15 @@ function contradictionSignalType(desc: string): string {
 export function buildVerdict(input: VerdictInput): AuditVerdict {
 	const clusters = input.clusters ?? [];
 	const strongCorroborated = clusters.filter(
-		(c) => isStrongIdentity(c.signalType) && c.corroborating && c.independentSources >= 2,
+		(c) => isStrongIdentity(c.signalType) && c.corroborating && c.independentSources >= 2 &&
+			(!c.accountStatus || c.accountStatus === "CONFIRMED"),
 	);
 	const strongAny = clusters.filter(
-		(c) => isStrongIdentity(c.signalType) && c.independentSources >= 1,
+		(c) => isStrongIdentity(c.signalType) && c.independentSources >= 1 &&
+			c.accountStatus !== "POSSIBLE",
 	);
 	const multiDomain = clusters.filter((c) => c.domainCount >= 2);
-	const corroborated = clusters.filter((c) => c.corroborating);
+	const corroborated = clusters.filter((c) => c.corroborating && c.accountStatus !== "POSSIBLE");
 
 	// Identity contradictions cap attribution confidence.
 	const identityContradictions = input.contradictionStrings.filter((d) => {

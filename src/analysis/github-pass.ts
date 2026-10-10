@@ -203,7 +203,7 @@ export function buildGitHubDepsFromFixture(
 ): GitHubPassDeps {
   return {
     ghGet: async (url) => {
-      const userMatch = url.match(/\/users\/([^/?]+)/);
+      const userMatch = url.match(/\/users\/([^/?]+)(?:\?|$)/); // profile only, not /users/x/repos
       if (userMatch) {
         const login = userMatch[1];
         const profile = profiles[login];
@@ -223,6 +223,25 @@ export function buildGitHubDepsFromFixture(
       }
       return { status: 404, json: null };
     },
+  };
+}
+
+/** Merge a secondary GitHub pass (alt-lead or corpus-disclosed handles) into
+ *  the primary one, deduping identities by login. */
+export function mergeGitHubPass(primary: GitHubPassResult | undefined | null, extra: GitHubPassResult): GitHubPassResult {
+  if (!primary) return extra;
+  const seen = new Set(primary.identities.map((i) => i.login.toLowerCase()));
+  const identities = [...primary.identities];
+  for (const id of extra.identities) {
+    const key = id.login.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    identities.push(id);
+  }
+  return {
+    queried: [...new Set([...primary.queried, ...extra.queried])],
+    identities,
+    rateLimited: primary.rateLimited || extra.rateLimited,
   };
 }
 

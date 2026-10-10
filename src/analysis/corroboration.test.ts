@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   calibrateConfidence,
+  checkCandidateHypothesis,
   clamp,
   computeCorroboration,
   mapOverallRisk,
@@ -10,6 +11,7 @@ import {
   normalizeLocation,
   normalizeName,
   parseAge,
+  renderCandidateHypothesisBlock,
   renderCorroborationBlock,
 } from "./corroboration.ts";
 import type { CorroborationInput, CorroborationResult, CorroborationCluster } from "./corroboration.ts";
@@ -18,6 +20,7 @@ import type { SocialHandle } from "./extract.ts";
 import type { WebSweepResult } from "./web-sweep.ts";
 import type { GitHubPassResult, GitHubIdentity } from "./github-pass.ts";
 import type { TwitterPassResult, TwitterUserProfile } from "./twitter-pass.ts";
+import { buildIdentityGraph } from "./identity-graph.ts";
 
 /* ── Fixture builders (no network, no LLM) ─────────────────────────────── */
 
@@ -173,6 +176,7 @@ describe("clustering", () => {
       directIdentifiers: { emails: [], socialHandles: [mkHandle("x", "john.doe", "https://x.com/john.doe")] },
       webSweep: mkWebSweep({
         identifiers: { emails: [], socialHandles: [mkHandle("instagram", "john_doe", "https://instagram.com/john_doe")] },
+        identifierSources: { emails: {}, handles: { "instagram:johndoe": ["https://example.org/john"] }, freemail: {} },
       }),
       gitHub: mkGitHub([mkGitHubIdentity({ login: "johndoe" })]),
     });
@@ -180,7 +184,7 @@ describe("clustering", () => {
     expect(handles.length).toBe(1);
     const h = handles[0];
     expect(h.domainCount).toBe(3);
-    // web: 1 platform (instagram) + github 1 + direct 1
+    // One cited web document + GitHub profile + corpus extraction.
     expect(h.sourceBreakdown.web).toBe(1);
     expect(h.sourceBreakdown.github).toBe(1);
     expect(h.sourceBreakdown.direct).toBe(1);
@@ -255,11 +259,11 @@ describe("clustering", () => {
       structured: mkStructured([mkFinding("real_name", "John Doe", ["https://reddit.com/r/askreddit/1"])]),
       gitHub: mkGitHub([
         mkGitHubIdentity({
-          login: "johndoe",
+          login: "jdoe",
           name: "John A. Doe",
           commitAuthors: [
-            { name: "John Doe", email: "john@acme.com", repo: "johndoe/repo1", attributedLogin: "johndoe" },
-            { name: "John Doe", email: "john@acme.com", repo: "johndoe/repo2", attributedLogin: "johndoe" },
+            { name: "John Doe", email: "john@acme.com", repo: "jdoe/repo1", attributedLogin: "jdoe" },
+            { name: "John Doe", email: "john@acme.com", repo: "jdoe/repo2", attributedLogin: "jdoe" },
           ],
         }),
       ]),
@@ -305,15 +309,15 @@ describe("independence counting", () => {
     expect(loc.sourceBreakdown.reddit_evidence).toBe(2);
   });
 
-  test("empty-evidence finding counts as 1 weak source", () => {
+  test("empty-evidence finding has zero weight", () => {
     const res = run({
       structured: mkStructured([mkFinding("real_name", "Jane Smith", [])]),
     });
-    const name = res.clusters.find((c) => c.signalType === "real_name")!;
-    expect(name.sourceBreakdown.reddit_evidence).toBe(1);
+    expect(res.clusters).toEqual([]);
+    expect(res.score).toBe(0);
   });
 
-  test("web platforms AND page URLs both count (capped at 3)", () => {
+  test("web page URLs count; platform metadata is not another source", () => {
     const res = run({
       webSweep: mkWebSweep({
         identifiers: { emails: [], socialHandles: [mkHandle("x", "janedoe", "https://x.com/janedoe")] },
@@ -326,8 +330,7 @@ describe("independence counting", () => {
       directIdentifiers: { emails: [], socialHandles: [] },
     });
     const h = res.clusters.find((c) => c.signalType === "handle")!;
-    // platform:x + url:page1 + url:page2 = 3 (cap)
-    expect(h.sourceBreakdown.web).toBe(3);
+    expect(h.sourceBreakdown.web).toBe(2);
   });
 
   test("cross-domain sum matches the plan example", () => {
@@ -460,8 +463,7 @@ describe("overallRisk + score", () => {
 
   test("score monotonic sanity + bounds", () => {
     const lone = run({ structured: mkStructured([mkFinding("location", "Hyderabad", [])]) });
-    expect(lone.score).toBeGreaterThanOrEqual(0);
-    expect(lone.score).toBeLessThanOrEqual(100);
+    expect(lone.score).toBe(0); // a claim without provenance has zero weight
 
     const rich = run({
       structured: mkStructured([
@@ -473,6 +475,7 @@ describe("overallRisk + score", () => {
       ]),
     });
     expect(rich.score).toBeGreaterThan(lone.score);
+    expect(rich.score).toBeLessThanOrEqual(100);
   });
 });
 
@@ -499,19 +502,15 @@ describe("edge cases", () => {
     expect(res.overallRisk).toBe("low");
   });
 
-  test("no permalinks anywhere → clusters still produced", () => {
+  test("no permalinks anywhere → unsupported claims cannot score", () => {
     const res = run({
       structured: mkStructured([
         mkFinding("real_name", "Jane Smith", []),
         mkFinding("location", "Pune", []),
       ]),
     });
-    const names = res.clusters.filter((c) => c.signalType === "real_name");
-    const locs = res.clusters.filter((c) => c.signalType === "location");
-    expect(names.length).toBe(1);
-    expect(locs.length).toBe(1);
-    expect(names[0].sourceBreakdown.reddit_evidence).toBe(1);
-    expect(locs[0].sourceBreakdown.reddit_evidence).toBe(1);
+    expect(res.clusters).toEqual([]);
+    expect(res.score).toBe(0);
   });
 
   test("malformed inputs never throw (total-function contract)", () => {
@@ -519,7 +518,7 @@ describe("edge cases", () => {
       structured: {
         overallRisk: "low",
         summary: "",
-        findings: [{ category: "other", nonsense: true }],
+        findings: [{ category: "other", nonsense: true }, mkFinding("real_name", "Jane Smith", ["https://reddit.com/r/1"])],
       } as any,
       directIdentifiers: { emails: [null], socialHandles: [{ platform: null, handle: null, url: null }] } as any,
       gitHub: {
@@ -529,9 +528,10 @@ describe("edge cases", () => {
       } as any,
       webSweep: { username: "x", identifiers: { emails: [null], socialHandles: [null] } } as any,
     });
-    expect(Array.isArray(malformed.clusters)).toBe(true);
-    expect(malformed.score).toBeGreaterThanOrEqual(0);
-    expect(malformed.score).toBeLessThanOrEqual(100);
+    // Malformed items are skipped per item, not by the catch-all empty result:
+    // the one well-formed finding still clusters.
+    expect(malformed.clusters.map((c) => c.value)).toEqual(["Jane Smith"]);
+    expect(malformed.score).toBeGreaterThan(0);
   });
 
   test("freemail vs custom domain affects the custom-email bonus", () => {
@@ -602,7 +602,7 @@ describe("no double counting across domains", () => {
       directIdentifiers: { emails: [], socialHandles: [] },
     });
     const h = res.clusters.find((c) => c.signalType === "handle")!;
-    expect(h.sourceBreakdown.web).toBe(2); // platform:instagram + url:page.com
+    expect(h.sourceBreakdown.web).toBe(1); // one originating page
     expect(h.sourceBreakdown.direct).toBe(0);
     expect(h.sourceBreakdown.github).toBe(0);
   });
@@ -614,7 +614,7 @@ describe("no double counting across domains", () => {
       directIdentifiers: { emails: [], socialHandles: [mkHandle("reddit", "janedoe", "https://reddit.com/u/janedoe")] },
       webSweep: mkWebSweep({
         identifiers: { emails: [], socialHandles: [mkHandle("x", "janedoe", "https://x.com/janedoe")] },
-        identifierSources: { emails: {}, handles: {}, freemail: {} },
+        identifierSources: { emails: {}, handles: { "x:janedoe": ["https://example.org/jane"] }, freemail: {} },
       }),
       gitHub: mkGitHub([mkGitHubIdentity({ login: "janedoe" })]),
     });
@@ -793,6 +793,7 @@ describe("reddit-side handle disclosures", () => {
   const mkSweep = () =>
     mkWebSweep({
       identifiers: { emails: [], socialHandles: [mkHandle("discord", "nightowl42", "https://discord.com/users/1")] },
+      identifierSources: { emails: {}, handles: { "discord:nightowl42": ["https://example.org/about"] }, freemail: {} },
     });
 
   test("corpus mention of a web-sweep handle adds a reddit source, corroborates, raises confidence", () => {
@@ -844,7 +845,7 @@ describe("reddit-side handle disclosures", () => {
     });
     const h = res.clusters.find((c) => c.signalType === "handle")!;
     expect(h.sourceBreakdown.reddit_evidence).toBe(1);
-    expect(h.evidence).toContain("/r/disclosure/1");
+    expect(h.evidence).toContain("https://reddit.com/r/disclosure/1");
   });
 
   test("audited username mentioned in the corpus never creates or feeds a cluster", () => {
@@ -862,7 +863,7 @@ describe("reddit-side handle disclosures", () => {
 /* ── Platform vs domain de-conflation in the tier bonus ────────────────── */
 
 describe("platform de-conflation", () => {
-  test("one platform through two pipes (web github.com + GitHub API) → NO cluster tier, domainCount 2", () => {
+  test("one GitHub profile through two pipes → one document and no cluster tier", () => {
     const res = run({
       webSweep: mkWebSweep({
         identifiers: { emails: [], socialHandles: [mkHandle("github", "janedoe", "https://github.com/janedoe")] },
@@ -876,8 +877,9 @@ describe("platform de-conflation", () => {
     });
     const h = res.clusters.find((c) => c.signalType === "handle")!;
     expect(h.tier).toBeUndefined(); // single platform → no tier, no +1 bonus
-    expect(h.domainCount).toBe(2); // but both pipes still show in the breakdown
-    expect(h.sourceBreakdown.web).toBe(2); // platform:github + url
+    expect(h.domainCount).toBe(1);
+    expect(h.independentSources).toBe(1);
+    expect(h.sourceBreakdown.web).toBe(0);
     expect(h.sourceBreakdown.github).toBe(1);
   });
 
@@ -921,5 +923,315 @@ describe("nested location containment", () => {
     expect(locs.length).toBe(2);
     expect(res.contradictions.some((c) => c.includes("Conflicting locations"))).toBe(true);
     expect(res.overallRisk).toBe("low"); // two mediums would be medium; the contradiction downgrades
+  });
+});
+
+describe("person-aware corroboration", () => {
+  test("a same-username account the graph split off never scores for the subject", () => {
+    const input: CorroborationInput = {
+      username: "target_user",
+      corpusTexts: [{ text: "I live in Manchester and love it", permalink: "https://reddit.com/r/test/comments/m/x" }],
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "target_user", name: "Ken Sato", email: "ken@corp.example", location: "Tokyo, Japan" })]),
+    };
+    const result = run({ ...input, identityGraph: buildIdentityGraph(input) });
+    const leaked = result.clusters.filter((c) => c.isSubject !== false && ["email", "real_name", "location"].includes(c.signalType));
+    expect(leaked).toEqual([]);
+    expect(result.score).toBe(0);
+  });
+
+  function withGraph(input: CorroborationInput): CorroborationResult {
+    return run({
+      ...input,
+      identityGraph: buildIdentityGraph({ ...input, corpusIdentifiers: input.directIdentifiers }),
+    });
+  }
+
+  test("namesake observations cannot merge with or change the subject's verdict", () => {
+    const subject = mkGitHubIdentity({
+      login: "target_user", name: "Avery Lane", location: "Hyderabad", company: "Acme",
+    });
+    const input: CorroborationInput = {
+      username: "target_user",
+      structured: mkStructured([
+        mkFinding("real_name", "Avery Lane", ["https://reddit.com/r/test/name"]),
+        mkFinding("location", "Hyderabad", ["https://reddit.com/r/test/location"]),
+        mkFinding("employer_or_school", "Acme", ["https://reddit.com/r/test/company"]),
+        mkFinding("age_or_dob", "19", ["https://reddit.com/r/test/age"]),
+      ]),
+      gitHub: mkGitHub([subject]),
+    };
+    const baseline = withGraph(input);
+    const result = withGraph({
+      ...input,
+      gitHub: mkGitHub([
+        subject,
+        mkGitHubIdentity({
+          login: "elsewhere", name: "Avery Stone", location: "Hyderabad, India", company: "Acme Inc",
+          accountCreated: "2000-01-01T00:00:00Z",
+          commitAuthors: [{ name: "Avery Stone", email: "", repo: "target_user/shared", attributedLogin: "elsewhere" }],
+        }),
+      ]),
+      twitter: mkTwitterResult([mkTwitterProfile({ screenName: "elsewhere", name: "Avery Stone", location: "Chennai" })]),
+    });
+    expect(result.clusters.filter((c) => c.isSubject !== false)).toEqual(baseline.clusters);
+    expect(result.clusters.filter((c) => c.isSubject === false).length).toBeGreaterThan(0);
+    expect(result.score).toBe(baseline.score);
+    expect(result.verdict).toEqual(baseline.verdict);
+    expect(result.overallRisk).toBe(baseline.overallRisk);
+    expect(result.contradictions).toEqual([]);
+    const separateLocations = result.clusters.filter((c) => c.signalType === "location" && c.isSubject === false);
+    expect(separateLocations.every((c) => c.contradictions?.length === 1)).toBe(true);
+    expect(renderCorroborationBlock(result)).toContain("separate person");
+  });
+
+  test("conflicting locations within the subject still downgrade risk", () => {
+    const result = withGraph({
+      username: "target_user",
+      structured: mkStructured([mkFinding("location", "Hyderabad", ["https://reddit.com/r/test/location"])]),
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "target_user", location: "Chennai" })]),
+    });
+    expect(result.clusters.filter((c) => c.signalType === "location").length).toBe(2);
+    expect(result.contradictions).toEqual(["Conflicting locations: Chennai vs Hyderabad"]);
+    expect(result.overallRisk).toBe("low");
+  });
+
+  test("corpus disclosure joins a previously separate handle before scoring", () => {
+    const input: CorroborationInput = {
+      username: "target_user",
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "newidentity", name: "Morgan Vale" })]),
+    };
+    expect(withGraph(input).score).toBe(0);
+    const result = withGraph({ ...input, corpusTexts: [{ text: "My handle is @newidentity", permalink: "https://reddit.com/r/test/alt" }] });
+    const handle = result.clusters.find((c) => c.signalType === "handle");
+    expect(handle?.isSubject).toBe(true);
+    expect(handle?.sourceBreakdown).toMatchObject({ reddit_evidence: 1, github: 1 });
+    expect(result.score).toBeGreaterThan(0);
+    expect(result.verdict.attributionConfidence).toBe("high");
+  });
+
+  test("each provenance URL contributes only to its page owner's person", () => {
+    const result = withGraph({
+      username: "target_user",
+      corpusTexts: [{ text: "My handle is newidentity", permalink: "https://reddit.com/r/test/handle" }],
+      gitHub: mkGitHub([
+        mkGitHubIdentity({ login: "target_user" }),
+        mkGitHubIdentity({ login: "elsewhere", name: "Avery Stone", blog: "https://other.example" }),
+      ]),
+      structured: mkStructured([mkFinding("location", "Chennai", ["https://github.com/elsewhere"])]),
+      webSweep: mkWebSweep({
+        identifiers: { emails: ["target_user@gmail.com"], socialHandles: [mkHandle("x", "newidentity", "https://x.com/newidentity")] },
+        identifierSources: {
+          handles: { "x:newidentity": ["https://x.com/newidentity", "https://github.com/elsewhere"] },
+          emails: { "target_user@gmail.com": ["https://github.com/target_user", "https://other.example/about"] },
+          freemail: { "target_user@gmail.com": true },
+        },
+      }),
+    });
+    const subjectHandle = result.clusters.find((c) => c.signalType === "handle" && c.value === "newidentity" && c.isSubject);
+    expect(subjectHandle?.sourceBreakdown.twitter).toBe(1);
+    const otherHandle = result.clusters.find((c) => c.signalType === "handle" && c.value === "newidentity" && c.isSubject === false);
+    expect(otherHandle?.sourceBreakdown.github).toBe(1);
+    const subjectEmail = result.clusters.find((c) => c.signalType === "email" && c.isSubject);
+    expect(subjectEmail?.sourceBreakdown.github).toBe(1);
+    expect(result.clusters.find((c) => c.signalType === "email" && c.isSubject === false)?.sourceBreakdown.web).toBe(1);
+    expect(result.clusters.find((c) => c.signalType === "location")?.isSubject).toBe(false);
+    expect(result.contradictions).toEqual([]);
+  });
+
+  test("email local-part bonus crosses a confidence boundary without inventing sources", () => {
+    const makeInput = (email: string): CorroborationInput => ({
+      username: "target_user",
+      directIdentifiers: { emails: [email], socialHandles: [] },
+      webSweep: mkWebSweep({
+        identifiers: { emails: [email], socialHandles: [] },
+        identifierSources: { emails: { [email.toLowerCase()]: ["https://example.org/about", "https://example.net/contact"] }, handles: {}, freemail: { [email.toLowerCase()]: true } },
+      }),
+    });
+    const matched = withGraph(makeInput("Target.User@gmail.com")).clusters.find((c) => c.signalType === "email")!;
+    const unmatched = withGraph(makeInput("unrelated@gmail.com")).clusters.find((c) => c.signalType === "email")!;
+    expect(matched.confidence).toBe("high");
+    expect(unmatched.confidence).toBe("medium");
+    expect(matched.emailLocalPartMatch).toBe(true);
+    expect(unmatched.emailLocalPartMatch).toBeUndefined();
+    expect(matched.sourceBreakdown).toEqual(unmatched.sourceBreakdown);
+    expect(matched.independentSources).toBe(3);
+    expect(matched.domainCount).toBe(2);
+    const single = withGraph({ username: "target_user", directIdentifiers: { emails: ["target_user@gmail.com"], socialHandles: [] } });
+    expect(single.clusters[0].confidence).toBe("low");
+    expect(single.clusters[0].independentSources).toBe(1);
+    const input = makeInput("Target.User@gmail.com");
+    const graph = buildIdentityGraph({ ...input, corpusIdentifiers: input.directIdentifiers });
+    const withoutEdge = run({ ...input, identityGraph: { ...graph, edges: [] } });
+    expect(withoutEdge.clusters.find((c) => c.signalType === "email")?.confidence).toBe("medium");
+    // Web-only email: a corpus email would be a subject disclosure, not a namesake.
+    const namesake = withGraph({
+      ...makeInput("elsewhere@gmail.com"),
+      directIdentifiers: { emails: [], socialHandles: [] },
+      gitHub: mkGitHub([mkGitHubIdentity({ login: "elsewhere", name: "Avery Stone" })]),
+    });
+    const namesakeEmail = namesake.clusters.find((c) => c.signalType === "email")!;
+    expect(namesakeEmail.isSubject).toBe(false);
+    expect(namesakeEmail.confidence).toBe("low"); // two web sources; +1 would make it medium
+    expect(namesakeEmail.emailLocalPartMatch).toBeUndefined();
+    expect(namesake.score).toBe(0);
+    expect(renderCorroborationBlock(withGraph(makeInput("Target.User@gmail.com")))).toContain("local-part match");
+  });
+});
+
+describe("identity-graph exposure floor", () => {
+  const url = "https://github.com/newidentity";
+  const sweep = (bridged: boolean) => mkWebSweep({
+    identifiers: { emails: [], socialHandles: [mkHandle("github", "newidentity", url)] },
+    identifierSources: { handles: { "github:newidentity": [url] }, emails: {}, freemail: {} },
+    bridgeEvidence: bridged ? { newidentity: [{ url, snippet: "formerly target_user", target: "target_user" }] } : {},
+  });
+  const profile = (extra: Partial<GitHubIdentity> = {}) =>
+    mkGitHub([mkGitHubIdentity({ login: "newidentity", name: "Morgan Vale", email: "morgan@vale.dev", location: "Pune", ...extra })]);
+  const scored = (input: CorroborationInput) => run({ ...input, identityGraph: buildIdentityGraph(input) });
+
+  test("a bridge to one profile with name + email floors risk at high without adding sources", () => {
+    const input = { username: "target_user", webSweep: sweep(true), gitHub: profile() };
+    const result = scored(input);
+    expect(result.clusters.every((c) => c.confidence === "low" && c.independentSources === 1)).toBe(true);
+    expect(result.overallRisk).toBe("high");
+    expect(result.verdict.exposureSeverity).toBe("high");
+    expect(run(input).overallRisk).toBe("low"); // no graph, no floor
+  });
+
+  test("name without email floors at medium; no strong link means no floor", () => {
+    expect(scored({ username: "target_user", webSweep: sweep(true), gitHub: profile({ email: undefined }) }).overallRisk).toBe("medium");
+    // Same profile, nothing tying it to the audited handle: a namesake stays low.
+    const namesake = scored({ username: "target_user", webSweep: sweep(false), gitHub: profile() });
+    expect(namesake.clusters.every((c) => c.isSubject === false)).toBe(true);
+    expect(namesake.overallRisk).toBe("low");
+  });
+
+  test("a handle-echo name is not a real name and cannot trigger the high floor", () => {
+    // Single-token handle echoes. (A two-token "New Identity" counts: GitHub's
+    // name field is a separate declaration even when the login derives from it.)
+    for (const name of ["newidentity", "new_identity", "NewIdentity"]) {
+      const result = scored({
+        username: "target_user", webSweep: sweep(true),
+        gitHub: profile({ name, commitAuthors: [{ name: "NewIdentity", email: "", repo: "newidentity/x", attributedLogin: "newidentity" }] }),
+      });
+      expect(result.clusters.some((c) => c.signalType === "real_name")).toBe(false);
+      expect(result.overallRisk).not.toBe("high");
+    }
+    // A real name from the same profile still clusters and floors at high.
+    expect(scored({ username: "target_user", webSweep: sweep(true), gitHub: profile({ name: "Alice Chen" }) }).overallRisk).toBe("high");
+  });
+
+  test("contradictions still downgrade the floored risk one step", () => {
+    const result = scored({
+      username: "target_user", webSweep: sweep(true), gitHub: profile(),
+      structured: mkStructured([mkFinding("location", "Chennai", ["https://reddit.com/r/test/loc"])]),
+    });
+    expect(result.contradictions).toEqual(["Conflicting locations: Chennai vs Pune"]);
+    expect(result.overallRisk).toBe("medium");
+    expect(mapOverallRisk([], [], "high")).toBe("high");
+  });
+});
+
+describe("document-level deduplication and account labels", () => {
+  const url = "https://github.com/janedoe";
+  const github = mkGitHub([mkGitHubIdentity({ login: "janedoe", name: "Jane Doe" })]);
+  const account = { platform: "github", handle: "janedoe", url, rationale: "" };
+
+  test("a scrape and an API read of one profile count once; another page adds weight", () => {
+    const sweep = (urls: string[]) => mkWebSweep({
+      identifiers: { emails: [], socialHandles: [mkHandle("github", "janedoe", url)] },
+      identifierSources: { handles: { "github:janedoe": urls }, emails: {}, freemail: {} },
+    });
+    const single = run({ gitHub: github });
+    const duplicate = run({ gitHub: github, webSweep: sweep(["http://www.github.com/JaneDoe/?utm_source=test"]) });
+    const handle = duplicate.clusters.find((c) => c.signalType === "handle")!;
+    expect(handle.independentSources).toBe(1);
+    expect(duplicate.score).toBe(single.score);
+    const independent = run({ gitHub: github, webSweep: sweep([url, "https://example.org/about"]) });
+    expect(independent.clusters.find((c) => c.signalType === "handle")?.independentSources).toBe(2);
+    expect(independent.score).toBeGreaterThan(duplicate.score);
+  });
+
+  test("POSSIBLE caps confidence; CONFIRMED is carried but adds no source", () => {
+    const base = { gitHub: github, directIdentifiers: { emails: [], socialHandles: [mkHandle("github", "janedoe", url)] } };
+    expect(run(base).clusters.find((c) => c.signalType === "handle")?.confidence).toBe("medium");
+    const possible = run({ ...base, structured: { ...mkStructured([]), accounts: [{ ...account, status: "POSSIBLE" as const }] } });
+    expect(possible.clusters.find((c) => c.signalType === "handle")?.confidence).toBe("low");
+    const confirmed = run({ ...base, structured: { ...mkStructured([]), accounts: [{ ...account, status: "CONFIRMED" as const }] } });
+    const handle = confirmed.clusters.find((c) => c.signalType === "handle")!;
+    expect(handle.accountStatus).toBe("CONFIRMED");
+    expect(handle.independentSources).toBe(run(base).clusters.find((c) => c.signalType === "handle")!.independentSources);
+  });
+
+  test("REJECTED drops an unlinked account but cannot overrule deterministic subject ownership", () => {
+    const input = { username: "target_user", gitHub: github, structured: { ...mkStructured([]), accounts: [{ ...account, status: "REJECTED" as const }] } };
+    expect(run(input).clusters).toEqual([]);
+    expect(run(input).score).toBe(0);
+    expect(run(input).rejectedAccounts).toEqual([`janedoe (${url})`]);
+    expect(renderCorroborationBlock(run(input))).toContain(`Removed by REJECTED labels** (with every observation read off them): janedoe (${url})`);
+    const owned = { ...input, corpusTexts: [{ text: "My github is janedoe", permalink: "/r/test/comments/abc/title/comment" }] };
+    const result = run({ ...owned, identityGraph: buildIdentityGraph(owned) });
+    expect(result.clusters.some((c) => c.isSubject && c.warnings?.length)).toBe(true);
+    expect(result.score).toBeGreaterThan(0);
+    expect(result.rejectedAccounts).toEqual([]);
+  });
+});
+
+describe("candidate hypothesis check", () => {
+  function evidence(withCommits = true, linked = true): CorroborationResult {
+    const input = {
+      username: "fixtureveil",
+      gitHub: mkGitHub([mkGitHubIdentity({
+        login: "fixturenew", name: "Rao, Asha Devi",
+        commitAuthors: withCommits ? ["one", "two"].map((repo) => ({
+          name: "Asha Rao", email: "asha@example.com", repo: `external/${repo}`, attributedLogin: "fixturenew",
+        })) : [],
+      })]),
+      corpusTexts: linked ? [{ text: "My github is fixturenew", permalink: "/r/test/comments/link/title/comment" }] : [],
+    };
+    return run({ ...input, identityGraph: buildIdentityGraph(input) });
+  }
+
+  test("matches token order/middle names against attributed commits without changing the verdict", () => {
+    const result = evidence();
+    const before = JSON.stringify(result);
+    const check = checkCandidateHypothesis({ name: "  ASHA Rao  " }, result)!;
+    expect(check.status).toBe("CONSISTENT");
+    expect(check.matches.map((m) => m.value)).toEqual(["Rao, Asha Devi"]);
+    expect(check.matches[0].evidence).toContain("https://github.com/external/one");
+    expect(renderCandidateHypothesisBlock(check)).toContain("**CONSISTENT**");
+    expect(renderCandidateHypothesisBlock(check)).toContain("[source](https://github.com/external/one)");
+    expect(JSON.stringify(result)).toBe(before);
+  });
+
+  test("disjoint strong subject names conflict; a shared surname or first name stays inconclusive", () => {
+    const result = evidence();
+    expect(checkCandidateHypothesis({ name: "Martin Cole" }, result)?.status).toBe("CONFLICTING");
+    expect(checkCandidateHypothesis({ name: "Martin Rao" }, result)?.status).toBe("INCONCLUSIVE");
+    expect(checkCandidateHypothesis({ name: "Asha Cole" }, result)?.status).toBe("INCONCLUSIVE");
+    expect(checkCandidateHypothesis({ name: "Rao" }, result)?.status).toBe("INCONCLUSIVE");
+  });
+
+  test("a namesake, weak single-document name, or missing evidence cannot confirm or refute the hypothesis", () => {
+    for (const result of [evidence(true, false), evidence(false)]) {
+      for (const name of ["Asha Rao", "Martin Cole"]) {
+        expect(checkCandidateHypothesis({ name }, result)?.status).toBe("INCONCLUSIVE");
+      }
+    }
+    expect(checkCandidateHypothesis({ name: "Asha Rao" })?.status).toBe("INCONCLUSIVE");
+    expect(checkCandidateHypothesis()).toBeUndefined();
+    expect(checkCandidateHypothesis({ name: " " }, evidence())).toBeUndefined();
+    expect(renderCandidateHypothesisBlock()).toBe("");
+  });
+
+  test("agreement and conflicting subject names together stay inconclusive", () => {
+    const result = evidence();
+    const name = result.clusters.find((c) => c.signalType === "real_name")!;
+    const check = checkCandidateHypothesis({ name: "Asha Rao" }, {
+      ...result, clusters: [...result.clusters, { ...name, key: "other-name", value: "Maria Costa" }],
+    })!;
+    expect(check.status).toBe("INCONCLUSIVE");
+    expect(check.matches).toHaveLength(1);
+    expect(check.conflicts.map((c) => c.value)).toEqual(["Maria Costa"]);
   });
 });

@@ -42,6 +42,19 @@ export interface Finding {
   remediation: string;
 }
 
+export type AccountStatus = "CONFIRMED" | "LIKELY" | "POSSIBLE" | "REJECTED";
+
+/** The synthesis agent's same-person judgment for one account. A label only
+ *  ever constrains corroboration (caps confidence, drops a rejected
+ *  non-subject handle) — it never adds a source, so it needs no citation. */
+export interface AccountVerification {
+  platform: string;
+  handle: string;
+  url: string;
+  status: AccountStatus;
+  rationale: string;
+}
+
 export interface IdentityProof {
   /** The exact real-world identity the report resolves (or strongest candidate). */
   exactUser: string;
@@ -56,6 +69,7 @@ export interface StructuredFindings {
   summary: string;
   identity?: IdentityProof;
   findings: Finding[];
+  accounts?: AccountVerification[];
   /** Result of validating evidence against the real corpus (set by
    *  validateStructuredFindings). Schema-valid ≠ real evidence: this records
    *  which quotes/permalinks were actually supported by the source. */
@@ -76,6 +90,15 @@ export const SCHEMA_HINT = `Return a JSON object of exactly this shape:
     "rationale": "short explanation of why this is the same user",
     "publicProofUrls": ["https://..."]
   },
+  "accounts": [
+    {
+      "platform": "github | x | ...",
+      "handle": "account handle",
+      "url": "https://platform/account",
+      "status": "CONFIRMED" | "LIKELY" | "POSSIBLE" | "REJECTED",
+      "rationale": "why this is (or is not) the same person"
+    }
+  ],
   "findings": [
     {
       "category": "location" | "employer_or_school" | "real_name" | "age_or_dob" | "gender" | "relationships_or_family" | "financial" | "health" | "schedule_or_routine" | "cross_platform_handle" | "external_link" | "writing_fingerprint" | "other",
@@ -99,6 +122,7 @@ RULES
 - overallRisk: "high" when many strong identifiers (real name, employer, email, confirmed cross-platform accounts) converge on one person; "medium" when several weak signals triangulate; "low" when little is resolvable.
 - identity.exactUser: the resolved real-world identity the report points to (or the strongest ranked candidate if multiple). If the report cannot resolve a real identity, set exactUser to the audited Reddit handle and explain the gap in rationale.
 - Preserve every public proof URL the report cites (GitHub, LinkedIn, personal site, profile pages).
+- accounts: carry the report's verification label for every account it assessed. Username equality or profile existence alone is POSSIBLE; REJECTED needs cited mismatch evidence.
 - Output ONLY the JSON object. No prose, no code fences.`;
 
 function safeJsonSlice(text: string): string {
@@ -165,6 +189,17 @@ function coerce(parsed: any): StructuredFindings {
     summary: String(parsed.summary ?? "").trim(),
     identity,
     findings,
+    accounts: Array.isArray(parsed.accounts)
+      ? parsed.accounts
+          .filter((a: any) => ["CONFIRMED", "LIKELY", "POSSIBLE", "REJECTED"].includes(a?.status) && a?.handle)
+          .map((a: any): AccountVerification => ({
+            platform: String(a.platform ?? "").trim().toLowerCase(),
+            handle: String(a.handle).trim(),
+            url: String(a.url ?? "").trim(),
+            status: a.status,
+            rationale: String(a.rationale ?? "").trim(),
+          }))
+      : [],
   };
 }
 
@@ -213,12 +248,13 @@ function permalinkInCorpus(candidate: string, validPerms: Set<string>): boolean 
 
 /** Build a CorpusManifest from raw Reddit posts + comments (pre-filter). */
 export function buildCorpusManifest(
-  items: Array<{ body?: string; title?: string; permalink?: string }>,
+  items: Array<{ body?: string; title?: string; selftext?: string; permalink?: string }>,
 ): CorpusManifest {
   const texts: string[] = [];
   const permalinks = new Set<string>();
   for (const it of items) {
-    texts.push(`${it.body ?? ""} ${it.title ?? ""}`);
+    // Posts carry their body in `selftext`, comments in `body`.
+    texts.push(`${it.title ?? ""} ${it.selftext ?? ""} ${it.body ?? ""}`);
     if (it.permalink) permalinks.add(normalizePermalinkForValidation(it.permalink));
   }
   return { texts, permalinks };
@@ -233,9 +269,10 @@ export function buildCorpusManifest(
  * quote does not appear in the corpus text, so unsupported evidence carries
  * zero weight downstream (corroboration counts only surviving permalinks).
  *
- * When no `manifest` is supplied (standard live path — no raw corpus in hand),
- * only URL-shape validation runs: malformed permalinks are dropped but quotes
- * cannot be checked, so the run degrades gracefully instead of over-filtering.
+ * When no `manifest` is supplied, only URL-shape validation runs: malformed
+ * permalinks are dropped but quotes cannot be checked. An EMPTY manifest means
+ * "the run holds no Reddit text": every permalinked/quoted entry is unverifiable
+ * and dropped (zero weight), while the finding's claim is kept.
  */
 export function validateStructuredFindings(
   sf: StructuredFindings,
@@ -246,6 +283,7 @@ export function validateStructuredFindings(
   let unsupported = 0;
 
   const hasCorpus = !!manifest && manifest.permalinks.size > 0;
+  const noCorpusText = !!manifest && manifest.permalinks.size === 0 && manifest.texts.length === 0;
   const joined = hasCorpus ? normalizeForQuote(manifest!.texts.join("\n\n")) : "";
   const validPerms = hasCorpus
     ? new Set([...manifest!.permalinks].map(normalizePermalinkForValidation))
@@ -260,6 +298,11 @@ export function validateStructuredFindings(
       if (p && !/^https?:\/\//i.test(p) && !p.startsWith("/r/")) {
         unsupported++;
         dropped.push(`malformed permalink: ${p.slice(0, 80)}`);
+        return false;
+      }
+      if (noCorpusText && (p || q)) {
+        unsupported++;
+        dropped.push(`no corpus text to verify: ${(p || q).slice(0, 80)}`);
         return false;
       }
       if (!hasCorpus) return true; // cannot check membership without a corpus
@@ -420,6 +463,15 @@ export function renderStructuredFindings(sf: StructuredFindings): string {
     lines.push(
       `*Evidence validation:* ${v.supported}/${v.checked} evidence entries supported by the source corpus${v.unsupported > 0 ? `; ${v.unsupported} dropped as unsupported (zero weight)` : ""}.*`,
     );
+  }
+
+  if (sf.accounts?.length) {
+    // Its own section ahead of the block the dashboard parses as cards.
+    const accountLines = ["## Account Verification", ""];
+    for (const a of sf.accounts) {
+      accountLines.push(`- **${a.status}** [${a.platform}:${a.handle}](${a.url})${a.rationale ? ` — ${a.rationale}` : ""}`);
+    }
+    lines.unshift(...accountLines, "", "---", "");
   }
 
   if (sf.findings.length === 0) {

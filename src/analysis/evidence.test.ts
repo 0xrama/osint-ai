@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  canonicalSourceUrl,
   buildVerdict,
   emptyIdentifierCollections,
   emptyVerdict,
@@ -162,4 +163,20 @@ describe("buildVerdict", () => {
     });
     expect(v.contradictions.map((c) => c.signalType).sort()).toEqual(["location", "real_name"]);
   });
+});
+
+test("account linkage labels constrain attribution without inventing or removing source documents", () => {
+  const cluster = { signalType: "handle", independentSources: 3, domainCount: 2, corroborating: true };
+  const levels = ["CONFIRMED", "LIKELY", "POSSIBLE"].map((accountStatus) => buildVerdict({
+    overallRisk: "medium", clusters: [{ ...cluster, accountStatus }], contradictionStrings: [],
+  }).attributionConfidence);
+  expect(levels).toEqual(["high", "medium", "low"]);
+});
+
+test("canonicalSourceUrl: one document identity across collectors", () => {
+  expect(canonicalSourceUrl("http://www.github.com/Jane/?utm_source=test#bio")).toBe("https://github.com/jane");
+  expect(canonicalSourceUrl("https://twitter.com/Jane/status/123?ref=foo")).toBe("https://x.com/jane/status/123");
+  expect(canonicalSourceUrl("/r/test/comments/abc/title/comment")).toBe("https://reddit.com/r/test/comments/abc/title/comment");
+  expect(canonicalSourceUrl("https://example.org/About?b=2&a=1")).toBe("https://example.org/About?a=1&b=2");
+  expect(canonicalSourceUrl("https://example.org/about")).not.toBe(canonicalSourceUrl("https://example.org/About"));
 });

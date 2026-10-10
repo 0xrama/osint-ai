@@ -26,6 +26,10 @@
  * source breakdown to a calibrated low/medium/high confidence, detects
  * contradictions, and produces a 0–100 exposure score + an `overallRisk`
  * ladder that `runAudit` reconciles into the report's headline risk.
+ * When supplied, the identity graph partitions observations by person before
+ * clustering. Separate persons remain inspectable but never affect the
+ * subject's score/verdict; graph-backed email local-part joins earn a small
+ * confidence bonus, not another independent observation.
  *
  * Purity contract: no fetch, no LLM, no `Date.now()` in the scoring path (the
  * only clock is the injected `now`, defaulting to `new Date()` for callers who
@@ -36,11 +40,13 @@
  */
 
 import { normalizeHandleKey, type DirectIdentifiers } from "./extract.ts";
-import { rankHandles, type WebSweepResult } from "./web-sweep.ts";
+import { profileRootHandle, rankHandles, type WebSweepResult } from "./web-sweep.ts";
 import type { GitHubPassResult, GitHubIdentity } from "./github-pass.ts";
-import { isReclaimedHandle, type TwitterPassResult } from "./twitter-pass.ts";
-import type { StructuredFindings, Finding, FindingCategory } from "./findings.ts";
-import { buildVerdict, emptyVerdict, type AuditVerdict } from "./evidence.ts";
+import { isReclaimedHandle, nameLooksReal, type TwitterPassResult } from "./twitter-pass.ts";
+import type { AccountStatus, StructuredFindings, Finding, FindingCategory } from "./findings.ts";
+import { canonicalSourceUrl, buildVerdict, emptyVerdict, type AuditVerdict } from "./evidence.ts";
+import type { IdentityGraph, PersonEntity } from "./identity-graph.ts";
+import type { Candidate } from "../types.ts";
 
 /** The entity dimensions we cluster independent signals around. */
 export type SignalType =
@@ -54,29 +60,32 @@ export type SignalType =
 /** Confidence buckets — reuse the report-wide vocabulary. */
 export type Confidence = "low" | "medium" | "high";
 
-/** Which independent domains contributed to a cluster. Each field counts
- *  DISTINCT sources within that domain (not a boolean). `twitter` is OPTIONAL
+/** Which originating domains contributed to a cluster. Each field counts
+ *  DISTINCT documents within that domain (not collectors). `twitter` is OPTIONAL
  *  (omitted by older call sites/tests — treated as 0) so the fifth domain
  *  rolled in without breaking the four-domain contract. */
 export interface SourceBreakdown {
   /** distinct Reddit permalinks across the finding evidence */
   reddit_evidence: number;
-  /** distinct web-sweep sources: distinct platforms/URLs for handles,
-   *  distinct pages for emails */
+  /** distinct web documents (excluding Reddit/GitHub/X origins) */
   web: number;
-  /** distinct GitHub anchors: profile fields + distinct commit repos */
+  /** distinct GitHub profiles and commit documents */
   github: number;
   /** distinct direct-identifier hits (regex emails/handles from the corpus) */
   direct: number;
-  /** distinct Twitter anchors: profile reads + alt-account candidates */
+  /** distinct X profile and tweet documents */
   twitter?: number;
 }
 
 /** One clustered entity assertion with its corroboration verdict. */
 export interface CorroborationCluster {
-  /** stable dedupe key: `${signalType}:${normalizedValue}` */
+  /** stable dedupe key, prefixed by person id when graph ownership is known */
   key: string;
   signalType: SignalType;
+  /** Graph ownership; absent for unconnected leads or graph-free callers. */
+  personId?: string;
+  /** False means a separate person: excluded from the subject's verdict. */
+  isSubject?: boolean;
   /** canonical display value (e.g. "Hyderabad", "johndoe", "Acme Corp") */
   value: string;
   confidence: Confidence;
@@ -89,6 +98,7 @@ export interface CorroborationCluster {
   corroborating: boolean;
   /** verbatim evidence strings/URLs backing the cluster (capped, for render) */
   evidence: string[];
+  accountStatus?: AccountStatus;
   /** present only when a same-type contradiction was detected */
   contradictions?: string[];
   /** cautionary flags that do NOT downgrade confidence (e.g. a reclaimed
@@ -98,6 +108,8 @@ export interface CorroborationCluster {
   tier?: "bridge" | "cross-platform cluster";
   /** email cluster only: true when the domain is a free-mail provider */
   freemail?: boolean;
+  /** Email local-part matches a handle joined to it in the subject graph. */
+  emailLocalPartMatch?: boolean;
 }
 
 /** The full corroboration verdict. */
@@ -116,11 +128,16 @@ export interface CorroborationResult {
    *  `overallRisk` is retained as a compatibility projection of
    *  `verdict.exposureSeverity`. */
   verdict: AuditVerdict;
+  /** Accounts a model REJECTED label removed, with everything read off them
+   *  (`handle (url)`) — surfaced so a wrong label never drops evidence silently. */
+  rejectedAccounts: string[];
 }
 
 /** The bundle of everything the layer fuses — mirrors what `runAudit` holds. */
 export interface CorroborationInput {
   username: string;
+  /** Full post-corpus graph, including disclosure edges, before scoring. */
+  identityGraph?: IdentityGraph;
   structured?: StructuredFindings;
   directIdentifiers?: DirectIdentifiers;
   webSweep?: WebSweepResult;
@@ -187,6 +204,62 @@ export function normalizeName(raw: string): string {
 export function nameTokens(raw: string): string[] {
   const t = normalizeName(raw).split(/\s+/).filter((tok) => tok.length >= 2);
   return [...new Set(t)];
+}
+
+export interface CandidateHypothesisCheck {
+  name: string;
+  status: "CONSISTENT" | "INCONCLUSIVE" | "CONFLICTING";
+  matches: Pick<CorroborationCluster, "value" | "evidence">[];
+  conflicts: Pick<CorroborationCluster, "value" | "evidence">[];
+}
+
+/** Test `--subject-name` against medium/high-confidence, subject-owned name
+ *  clusters. Read-only: never adds weight or changes the verdict. */
+export function checkCandidateHypothesis(
+  candidate?: Candidate,
+  corroboration?: CorroborationResult,
+): CandidateHypothesisCheck | undefined {
+  const name = candidate?.name?.trim();
+  if (!name) return undefined;
+  const tokens = nameTokens(name);
+  const names = (corroboration?.clusters ?? []).filter((c) =>
+    c.signalType === "real_name" && c.isSubject === true && c.confidence !== "low" && nameTokens(c.value).length >= 2);
+  const shared = (c: CorroborationCluster) => nameTokens(c.value).filter((t) => tokens.includes(t)).length;
+  // A surname alone is not agreement; middle names and token order may vary.
+  const matches = tokens.length < 2 ? [] : names.filter((c) =>
+    shared(c) >= 2 && shared(c) === Math.min(tokens.length, nameTokens(c.value).length));
+  const conflicts = tokens.length < 2 ? [] : names.filter((c) => shared(c) === 0);
+  const partial = names.some((c) => shared(c) > 0 && !matches.includes(c));
+  const status = matches.length > 0 && conflicts.length === 0 && !partial ? "CONSISTENT" :
+    matches.length === 0 && conflicts.length > 0 && !partial ? "CONFLICTING" : "INCONCLUSIVE";
+  const project = (c: CorroborationCluster) => ({ value: c.value, evidence: [...c.evidence] });
+  return {
+    name,
+    status,
+    matches: matches.map(project),
+    conflicts: conflicts.map(project),
+  };
+}
+
+export function renderCandidateHypothesisBlock(check?: CandidateHypothesisCheck): string {
+  if (!check) return "";
+  const lines = [
+    "## Deterministic Candidate Hypothesis Check",
+    "",
+    `Candidate: **${check.name}** — **${check.status}**.`,
+    "",
+    "Only medium/high-confidence, subject-owned name evidence counts. Agreement requires at least two shared name tokens; partial matches remain inconclusive. This checks consistency, not identity proof, and does not change the exposure score.",
+    "",
+  ];
+  for (const [label, entries] of [["Matching name", check.matches], ["Conflicting name", check.conflicts]] as const) {
+    for (const entry of entries) {
+      lines.push(`- ${label}: **${entry.value}** — ${entry.evidence.map((url) => `[source](${url})`).join(", ")}`);
+    }
+  }
+  if (check.matches.length === 0 && check.conflicts.length === 0) {
+    lines.push("No sufficient subject-owned name evidence matched or refuted the candidate.");
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -305,12 +378,15 @@ export function maxRisk(a: Confidence, b: Confidence): Confidence {
  *   2. one high, OR two+ medium → "medium"
  *   3. one medium → "medium"
  *   4. else → "low"
- * Contradictions CAP confidence (downgrade one step, never below "low").
+ * `floor` (the identity-graph exposure floor) raises the ladder result first;
+ * contradictions then CAP it (downgrade one step, never below "low").
  */
 export function mapOverallRisk(
   clusters: CorroborationCluster[],
   contradictions: string[],
+  floor: Confidence = "low",
 ): Confidence {
+  clusters = clusters.filter((c) => c.isSubject !== false);
   const high = clusters.filter((c) => c.confidence === "high");
   const med = clusters.filter((c) => c.confidence === "medium");
   const strongIdentity = high.some(
@@ -322,6 +398,7 @@ export function mapOverallRisk(
   else if (high.length === 1 || med.length >= 2) risk = "medium";
   else if (med.length === 1) risk = "medium";
   else risk = "low";
+  risk = maxRisk(risk, floor);
 
   // Contradictions in core identity signals cap attribution confidence.
   if (
@@ -340,6 +417,7 @@ export function mapOverallRisk(
 
 interface ClusterAccumulator {
   signalType: SignalType;
+  person?: PersonEntity;
   /** stable dedupe key */
   key: string;
   /** canonical display value (best-scoring surface form seen) */
@@ -378,11 +456,7 @@ function addSource(
  * ──────────────────────────────────────────────────────────────────────── */
 
 function normPermalink(permalink: string): string {
-  return permalink
-    .trim()
-    .replace(/\/+$/, "")
-    .replace(/^https?:\/\/(www\.)?/i, "")
-    .toLowerCase();
+  return canonicalSourceUrl(permalink) || permalink.trim();
 }
 
 /**
@@ -430,6 +504,10 @@ function finalizeCluster(acc: ClusterAccumulator): CorroborationCluster {
     corroborating: independentSources >= 2,
     evidence: acc.evidence.slice(0, 3),
   };
+  if (acc.person) {
+    cluster.personId = acc.person.id;
+    cluster.isSubject = acc.person.isSubject;
+  }
   if (acc.tier) cluster.tier = acc.tier;
   return cluster;
 }
@@ -443,9 +521,46 @@ function computeInner(
   const currentYear = now.getUTCFullYear();
 
   const structured = input.structured;
+  const accounts = structured?.accounts ?? [];
+  const statusOf = (handle: string) =>
+    accounts.find((a) => normalizeHandleKey(a.handle) === normalizeHandleKey(handle))?.status;
   const di = input.directIdentifiers;
   const webSweep = input.webSweep;
   const gitHub = input.gitHub;
+  const graph = input.identityGraph;
+  const personByNode = new Map<string, PersonEntity>();
+  for (const person of graph?.persons ?? []) {
+    for (const id of [...person.handleNodes, ...person.emailNodes, ...person.nameNodes]) {
+      personByNode.set(id, person);
+    }
+  }
+  const subject = graph?.persons.find((p) => p.isSubject);
+  // A same-username account the graph split off as a namesake lives at
+  // `handle:<key>@<platform>`; prefer it so its fields never score for the subject.
+  const handleNodeId = (handle: string, platform?: string) => {
+    const id = `handle:${normalizeHandleKey(handle)}`;
+    return platform && personByNode.has(`${id}@${platform}`) ? `${id}@${platform}` : id;
+  };
+  const personForHandle = (handle: string, platform?: string) => personByNode.get(handleNodeId(handle, platform));
+  const nodeById = new Map(graph?.nodes.map((n) => [n.id, n]) ?? []);
+  const ownedSites = (graph?.edges ?? []).filter((e) => e.kind === "site-of")
+    .flatMap((e) => {
+      const person = personByNode.get(e.from);
+      const site = nodeById.get(e.to);
+      return person && site ? [{ person, source: normPermalink(site.value) }] : [];
+    });
+  const personForSource = (source: string): PersonEntity | null | undefined => {
+    // A personal site's domain need not resemble its owner's handle. Site
+    // edges do not merge persons, but they DO identify the owner of a page.
+    const url = normPermalink(source);
+    const owners = new Map(ownedSites
+      .filter((s) => url === s.source || url.startsWith(`${s.source}/`))
+      .map((s) => [s.person.id, s.person]));
+    if (owners.size > 0) return owners.size === 1 ? [...owners.values()][0] : null;
+    const handle = profileRootHandle(/^https?:\/\//i.test(source) ? source : `https://${source}`);
+    const host = url.startsWith("https://x.com/") ? "x" : url.startsWith("https://github.com/") ? "github" : undefined;
+    return handle ? personForHandle(handle, host) : undefined;
+  };
 
   /* ── Collect candidate signals into per-type lists ── */
   type Candidate = {
@@ -459,6 +574,9 @@ function computeInner(
     sourceId: string;
     /** extra evidence string for the cluster */
     evidence: string;
+    /** Explicit account owner, especially for commits in someone else's repo. */
+    ownerNode?: string;
+    person?: PersonEntity;
     /** REAL platform for handle candidates (e.g. "github", "x", "discord") —
      *  NOT the pipe it arrived through. Feeds rankHandles so the cluster-tier
      *  bonus reflects platform diversity; `domain` remains the pipe for the
@@ -466,7 +584,7 @@ function computeInner(
     platform?: string;
   };
 
-  const candidates: Candidate[] = [];
+  let candidates: Candidate[] = [];
 
   // --- Structured findings (Reddit domain, permalinks) ---
   const findings: Finding[] = structured?.findings ?? [];
@@ -484,9 +602,8 @@ function computeInner(
     const permalinks = (f?.evidence ?? [])
       .map((e) => normPermalink(String(e?.permalink ?? "")))
       .filter(Boolean);
-    // Distinct permalinks = independent Reddit sources. A finding with a claim
-    // but no permalinks still counts as 1 weak source (never silently vanishes).
-    const perms = permalinks.length > 0 ? [...new Set(permalinks)] : [""];
+    // A claim without captured provenance has zero weight.
+    const perms = permalinks.length > 0 ? [...new Set(permalinks)] : [];
     const norm = normalizeClaimValue(signalType, claim);
 
     for (const p of perms) {
@@ -535,18 +652,16 @@ function computeInner(
     if (!norm) continue;
     const key = `${h?.platform ?? "?"}:${norm}`;
     const urls = idSources?.handles?.[key.toLowerCase()] ?? [];
-    // Distinct platforms AND distinct page URLs count as web sources (deduped).
-    const members = new Set<string>();
-    members.add(`platform:${h?.platform ?? "?"}`);
-    for (const u of urls.slice(0, 3)) members.add(`url:${u}`);
-    for (const m of members) {
+    // Platforms describe accounts, not independent source observations.
+    // An empty source preserves the lead without giving it evidence weight.
+    for (const url of new Set(urls.length ? urls.slice(0, 3) : [""])) {
       candidates.push({
         signalType: "handle",
         norm,
         display: String(h?.handle ?? norm),
         domain: "web",
-        sourceId: `web:${m}`,
-        evidence: urls[0] ?? "",
+        sourceId: url ? `web:url:${url}` : "",
+        evidence: url,
         platform: String(h?.platform ?? "?"),
       });
     }
@@ -575,6 +690,7 @@ function computeInner(
   for (const id of ghIdentities) {
     const login = String(id?.login ?? "").toLowerCase();
     if (!login) continue;
+    const start = candidates.length;
     if (id?.location) {
       candidates.push({
         signalType: "location",
@@ -597,7 +713,7 @@ function computeInner(
         evidence: id.url ?? "",
       });
     }
-    if (id?.name) {
+    if (id?.name && nameLooksReal(id.name)) {
       candidates.push({
         signalType: "real_name",
         norm: normalizeName(id.name),
@@ -641,7 +757,7 @@ function computeInner(
     // Commit-author real names: distinct repos = independent git anchors.
     for (const ca of id?.commitAuthors ?? []) {
       const name = String(ca?.name ?? "").trim();
-      if (!name) continue;
+      if (!nameLooksReal(name)) continue;
       const repo = String(ca?.repo ?? "");
       candidates.push({
         signalType: "real_name",
@@ -652,6 +768,7 @@ function computeInner(
         evidence: repo ? `https://github.com/${repo}` : "",
       });
     }
+    for (const c of candidates.slice(start)) c.ownerNode = handleNodeId(login, "github");
   }
 
   // --- Twitter pass (twitter domain: profile reads + alt-account candidates) ---
@@ -676,11 +793,7 @@ function computeInner(
     // Display name → real_name candidate (multi-token names that don't echo
     // the handle — the "0x handle with an Indian-name display name" signature).
     const name = String(p.name ?? "").trim();
-    if (
-      /\s/.test(name) &&
-      name.split(/\s+/).filter((t) => t.length >= 2).length >= 2 &&
-      normalizeHandleKey(name) !== norm
-    ) {
+    if (nameLooksReal(name, p.screenName)) {
       candidates.push({
         signalType: "real_name",
         norm: normalizeName(name),
@@ -713,11 +826,7 @@ function computeInner(
         platform: "x",
       });
       const altName = String(alt.profile.name ?? "").trim();
-      if (
-        /\s/.test(altName) &&
-        altName.split(/\s+/).filter((t) => t.length >= 2).length >= 2 &&
-        normalizeHandleKey(altName) !== altNorm
-      ) {
+      if (nameLooksReal(altName, alt.profile.screenName)) {
         candidates.push({
           signalType: "real_name",
           norm: normalizeName(altName),
@@ -756,6 +865,29 @@ function computeInner(
     }
   }
 
+  // A REJECTED label drops that account and everything read off its profile,
+  // unless deterministic graph ownership says it is the subject's.
+  const rejected = accounts.filter((a) => a.status === "REJECTED" && !personForHandle(a.handle)?.isSubject);
+  const removedBy = (a: (typeof accounts)[number], c: Candidate) =>
+    (c.signalType === "handle" && c.norm === normalizeHandleKey(a.handle)) ||
+    (!!canonicalSourceUrl(a.url) && canonicalSourceUrl(a.url) === canonicalSourceUrl(c.evidence));
+  const rejectedAccounts = rejected.filter((a) => candidates.some((c) => removedBy(a, c)))
+    .map((a) => (a.url ? `${a.handle} (${a.url})` : a.handle));
+  candidates = candidates.filter((c) => !rejected.some((a) => removedBy(a, c)));
+
+  // Attribute the observation's OWNER before its value: a namesake's profile
+  // may mention a subject identifier, and that mention must not strengthen
+  // the subject. Unknown leads retain legacy behavior, without person fusion.
+  for (const c of candidates) {
+    const nodeId = c.signalType === "handle" ? `handle:${c.norm}` :
+      c.signalType === "email" ? `email:${c.norm}` : undefined;
+    const owner = c.ownerNode ? personByNode.get(c.ownerNode) : personForSource(c.evidence);
+    // A shared site's ambiguous ownership must not fall back to the subject
+    // merely because the page repeats a subject identifier.
+    c.person = owner === null ? undefined : owner ?? (nodeId ? personByNode.get(nodeId) : undefined);
+    if (owner !== null && !c.person && c.domain === "reddit") c.person = subject;
+  }
+
   /* ── Bucket candidates into clusters ── */
 
   // Exact-keyed clusters: handles + emails.
@@ -766,12 +898,14 @@ function computeInner(
     norm: string,
     display: string,
     domain: "reddit" | "web" | "github" | "direct" | "twitter" = "web",
+    person?: PersonEntity,
   ): ClusterAccumulator => {
-    const key = `${signalType}:${norm}`;
+    const key = `${person ? `${person.id}|` : ""}${signalType}:${norm}`;
     let acc = clusters.get(key);
     if (!acc) {
       acc = {
         signalType,
+        person,
         key,
         value: display,
         displayDomain: domain,
@@ -801,16 +935,20 @@ function computeInner(
     sourceId: string,
     evidence: string,
   ) => {
-    addSource(acc, domain, sourceId);
+    // One originating document counts once, under the domain it lives on,
+    // no matter which collector read it.
+    const url = domain === "direct" ? "" : canonicalSourceUrl(evidence);
+    const host = url ? new URL(url).hostname : "";
+    const origin = host === "reddit.com" ? "reddit" : host === "github.com" ? "github" : host === "x.com" ? "twitter" : domain;
+    addSource(acc, origin, url || sourceId);
     if (evidence && acc.evidence.length < 3 && !acc.evidence.includes(evidence)) {
       acc.evidence.push(evidence);
     }
   };
 
   // Handles: reuse rankHandles for canonical clusters + seed hygiene.
-  // Build a merged DirectIdentifiers handle list from all handle candidates,
-  // then rank it once; attribute each ranked cluster's sources back by
-  // membership on normalizeHandleKey.
+  // Rank each person's handle candidates separately; attribute sources back
+  // by normalized variant membership without pooling different people.
   // Platform de-conflation: `platform` carries the REAL platform (github, x,
   // discord, …), never the arrival pipe — a handle scraped on github.com via
   // the web sweep AND read via the GitHub REST API is ONE platform through two
@@ -818,40 +956,40 @@ function computeInner(
   // handle sources (corpus mentions, disclosure findings) attach to clusters
   // directly below and are deliberately excluded here so platform diversity
   // never sees them.
-  const ranked = rankHandles(
-    candidates
-      .filter((c) => c.signalType === "handle" && c.domain !== "reddit")
-      .map((c) => ({ platform: c.platform ?? c.domain, handle: c.display, url: c.evidence || "" })),
-    username,
-    webSweep?.bridgeEvidence,
-  );
-
-  const handleSources = new Map<
-    string,
-    Array<{ domain: "reddit" | "web" | "github" | "direct" | "twitter"; sourceId: string; evidence: string }>
-  >();
+  const handleGroups = new Map<string, Candidate[]>();
   for (const c of candidates) {
     if (c.signalType !== "handle") continue;
-    const norm = c.norm;
-    const arr = handleSources.get(norm) ?? [];
-    arr.push({ domain: c.domain, sourceId: c.sourceId, evidence: c.evidence });
-    handleSources.set(norm, arr);
+    const key = c.person?.id ?? "";
+    const group = handleGroups.get(key) ?? [];
+    group.push(c);
+    handleGroups.set(key, group);
   }
 
-  for (const r of ranked) {
-    const norm = normalizeHandleKey(r.handle);
-    if (!norm || norm === normalizeHandleKey(username)) continue; // drop audited handle
-    const acc = findOrCreate("handle", norm, r.handle, "web");
-    acc.rawValues = new Set([...acc.rawValues, ...r.variants]);
-    for (const s of handleSources.get(norm) ?? []) {
-      addToCluster(acc, s.domain, s.sourceId, s.evidence);
-    }
-    // Bridge / cross-platform cluster tier earns a corroboration bonus.
-    if (r.tier === "bridge" || r.tier === "cross-platform cluster") {
-      acc.tier = r.tier;
-    }
+  for (const group of handleGroups.values()) {
+    const person = group[0].person;
+    const ranked = rankHandles(
+      group
+        .filter((c) => c.domain !== "reddit")
+        .map((c) => ({ platform: c.platform ?? c.domain, handle: c.display, url: c.evidence || "" })),
+      username,
+      webSweep?.bridgeEvidence,
+    );
+    for (const r of ranked) {
+      const norm = normalizeHandleKey(r.handle);
+      if (!norm || norm === normalizeHandleKey(username)) continue; // drop audited handle
+      const acc = findOrCreate("handle", norm, r.handle, "web", person);
+      acc.rawValues = new Set([...acc.rawValues, ...r.variants]);
+      const variants = new Set(graph ? r.variants.map(normalizeHandleKey) : [norm]);
+      for (const s of group.filter((c) => variants.has(c.norm))) {
+        addToCluster(acc, s.domain, s.sourceId, s.evidence);
+      }
+      // Bridge / cross-platform cluster tier earns a corroboration bonus.
+      if (r.tier === "bridge" || r.tier === "cross-platform cluster") {
+        acc.tier = r.tier;
+      }
       if (acc.evidence.length === 0) {
-      for (const u of r.urls.slice(0, 3)) acc.evidence.push(u);
+        for (const u of r.urls.slice(0, 3)) acc.evidence.push(u);
+      }
     }
   }
 
@@ -867,7 +1005,8 @@ function computeInner(
     const out: Array<{ acc: ClusterAccumulator; norm: string }> = [];
     for (const acc of clusters.values()) {
       if (acc.signalType !== "handle") continue;
-      const norm = acc.key.slice("handle:".length);
+      if (acc.person && !acc.person.isSubject) continue;
+      const norm = normalizeHandleKey(acc.value);
       if (norm.length >= 4) out.push({ acc, norm });
     }
     return out;
@@ -925,7 +1064,7 @@ function computeInner(
   // Emails: exact-keyed clusters.
   for (const c of candidates) {
     if (c.signalType !== "email") continue;
-    const acc = findOrCreate("email", c.norm, c.display, c.domain);
+    const acc = findOrCreate("email", c.norm, c.display, c.domain, c.person);
     addToCluster(acc, c.domain, c.sourceId, c.evidence);
   }
 
@@ -941,6 +1080,7 @@ function computeInner(
     let matched: ClusterAccumulator | null = null;
     for (const existing of clusters.values()) {
       if (existing.signalType !== c.signalType) continue;
+      if (existing.person?.id !== c.person?.id) continue;
       if (signalValuesOverlap(c.signalType, existing.value, c.display)) {
         matched = existing;
         break;
@@ -949,7 +1089,7 @@ function computeInner(
     if (!matched) {
       // Only open a new cluster if the norm is meaningful.
       if (!c.norm) continue;
-      matched = findOrCreate(c.signalType, c.norm, c.display, c.domain);
+      matched = findOrCreate(c.signalType, c.norm, c.display, c.domain, c.person);
     } else {
       // Prefer typed fields over claim sentences; among equals, the longest.
       if (displayScore(c.domain, c.display) > displayScore(matched.displayDomain, matched.value)) {
@@ -966,6 +1106,7 @@ function computeInner(
     const login = String(id?.login ?? "").toLowerCase();
     if (!id?.accountCreated) continue;
     for (const acc of clusters.values()) {
+      if (graph && acc.person?.id !== personForHandle(login)?.id) continue;
       if (acc.signalType === "age" && login) {
         acc.accountCreated ??= id.accountCreated;
       }
@@ -973,6 +1114,14 @@ function computeInner(
   }
 
   /* ── Finalize + calibrate clusters ── */
+  const localPartEmails = new Set<string>();
+  for (const edge of graph?.edges ?? []) {
+    if (edge.kind !== "email-of" || edge.strength < 0.6 || !edge.from.startsWith("handle:") || !edge.to.startsWith("email:")) continue;
+    const email = edge.to.slice("email:".length);
+    if (edge.from !== `handle:${normalizeHandleKey(email.split("@")[0])}`) continue;
+    const owner = personByNode.get(edge.from);
+    if (owner?.isSubject && personByNode.get(edge.to)?.id === owner.id) localPartEmails.add(email);
+  }
   const finalClusters: CorroborationCluster[] = [];
   for (const acc of clusters.values()) {
     const fc = finalizeCluster(acc);
@@ -983,10 +1132,14 @@ function computeInner(
       const email = acc.value;
       const freemail = webSweep?.identifierSources?.freemail?.[email] ?? true;
       if (!freemail) extra += 1; // custom-domain email: stronger anchor
+      if (fc.isSubject === true && localPartEmails.has(email.toLowerCase().trim())) {
+        extra += 1;
+        fc.emailLocalPartMatch = true;
+      }
     }
     if (fc.signalType === "handle") {
       const tier = acc.tier;
-      if (tier === "bridge" || tier === "cross-platform cluster") extra += 1;
+      if (fc.independentSources > 0 && (tier === "bridge" || tier === "cross-platform cluster")) extra += 1;
     }
     if (extra !== 0) {
       const recalced = calibrateConfidence(fc.sourceBreakdown, extra);
@@ -997,6 +1150,16 @@ function computeInner(
     // Email free-mail flag for renderer + tests.
     if (fc.signalType === "email") {
       fc.freemail = webSweep?.identifierSources?.freemail?.[fc.value] ?? true;
+    }
+    // Labels only ever constrain: POSSIBLE/LIKELY cap confidence; a REJECTED
+    // label that survived the candidate filter is subject-owned.
+    const status = fc.signalType === "handle" ? statusOf(fc.value) : undefined;
+    if (status === "REJECTED") {
+      fc.warnings = ["REJECTED label conflicts with deterministic subject ownership; graph evidence retained"];
+    } else if (status) {
+      fc.accountStatus = status;
+      if (status === "POSSIBLE") fc.confidence = "low";
+      if (status === "LIKELY" && fc.confidence === "high") fc.confidence = "medium";
     }
     finalClusters.push(fc);
   }
@@ -1019,7 +1182,7 @@ function computeInner(
     );
   }
   for (const c of finalClusters) {
-    if (c.signalType !== "handle") continue;
+    if (c.signalType !== "handle" || c.isSubject === false) continue;
     const created = twitterHandleCreated.get(normalizeHandleKey(c.value));
     if (!created || !subjectISO) continue;
     if (isReclaimedHandle(created, subjectISO)) {
@@ -1040,8 +1203,9 @@ function computeInner(
       for (let j = i + 1; j < locationClusters.length; j++) {
         const a = locationClusters[i];
         const b = locationClusters[j];
+        if (a.personId !== b.personId) continue;
         if (a.independentSources >= 1 && b.independentSources >= 1) {
-          pairs.push(`${a.value} vs ${b.value}`);
+          if (a.isSubject !== false) pairs.push(`${a.value} vs ${b.value}`);
           a.contradictions = [...(a.contradictions ?? []), b.value];
           b.contradictions = [...(b.contradictions ?? []), a.value];
         }
@@ -1058,8 +1222,9 @@ function computeInner(
       for (let j = i + 1; j < employerClusters.length; j++) {
         const a = employerClusters[i];
         const b = employerClusters[j];
+        if (a.personId !== b.personId) continue;
         if (a.independentSources >= 2 && b.independentSources >= 2) {
-          pairs.push(`${a.value} vs ${b.value}`);
+          if (a.isSubject !== false) pairs.push(`${a.value} vs ${b.value}`);
           a.contradictions = [...(a.contradictions ?? []), b.value];
           b.contradictions = [...(b.contradictions ?? []), a.value];
         }
@@ -1076,11 +1241,12 @@ function computeInner(
       for (let j = i + 1; j < nameClusters.length; j++) {
         const a = nameClusters[i];
         const b = nameClusters[j];
+        if (a.personId !== b.personId) continue;
         const aTok = nameTokens(a.value);
         const bTok = nameTokens(b.value);
         const shared = aTok.some((t) => bTok.includes(t));
         if (!shared && a.independentSources >= 1 && b.independentSources >= 1) {
-          pairs.push(`${a.value} vs ${b.value}`);
+          if (a.isSubject !== false) pairs.push(`${a.value} vs ${b.value}`);
           a.contradictions = [...(a.contradictions ?? []), b.value];
           b.contradictions = [...(b.contradictions ?? []), a.value];
         }
@@ -1097,6 +1263,7 @@ function computeInner(
     if (!parsed) continue;
     const age = typeof parsed === "number" ? parsed : Math.round((parsed[0] + parsed[1]) / 2);
     for (const id of ghIdentities) {
+      if (graph && ageCl.personId !== personForHandle(id.login)?.id) continue;
       const created = String(id?.accountCreated ?? "");
       const yearMatch = created.match(/^(\d{4})/);
       if (!yearMatch) continue;
@@ -1104,7 +1271,7 @@ function computeInner(
       if (createdYear <= 0) continue;
       const openAge = age - (currentYear - createdYear);
       if (openAge < 8 || age < 10 || age > 100) {
-        contradictions.push(
+        if (ageCl.isSubject !== false) contradictions.push(
           `Age estimate (${age}) inconsistent with GitHub account created ${createdYear}`,
         );
         ageCl.contradictions = [...(ageCl.contradictions ?? []), `GitHub account created ${createdYear}`];
@@ -1116,8 +1283,9 @@ function computeInner(
   const uniqueContradictions = [...new Set(contradictions)].sort();
 
   /* ── Score (0–100 advisory exposure gauge) ── */
+  const subjectClusters = finalClusters.filter((c) => c.isSubject !== false && c.independentSources > 0);
   let score = 0;
-  for (const c of finalClusters) {
+  for (const c of subjectClusters) {
     const baseWeight =
       c.confidence === "high" ? 22 : c.confidence === "medium" ? 12 : 4;
     const identityMult = strongIdentityType(c.signalType) ? 1.3 : 1.0;
@@ -1126,11 +1294,26 @@ function computeInner(
   }
   score = clamp(Math.round(score), 0, 100);
 
-  const overallRisk = mapOverallRisk(finalClusters, uniqueContradictions);
+  // Exposure floor: a rename / anchor-rename / disclosure edge (strength >= 0.7)
+  // joining the audited handle to another subject handle proves the subject's
+  // clusters are the subject's, even when one profile supplied them all (each
+  // single-source, so low confidence). It floors exposure, never adds sources:
+  // any subject strong-identity cluster → "medium"; a real name AND an email →
+  // "high". Applied before the contradiction downgrade, which still costs a step.
+  const auditedNode = `handle:${normalizeHandleKey(username)}`;
+  const linked = !!subject && (graph?.edges ?? []).some((e) =>
+    (e.kind === "rename" || e.kind === "anchor-rename" || e.kind === "disclosure") && e.strength >= 0.7 &&
+    (e.from === auditedNode || e.to === auditedNode) && e.from !== e.to &&
+    subject.handleNodes.includes(e.from) && subject.handleNodes.includes(e.to));
+  const exposed = linked ? subjectClusters.filter((c) =>
+    c.isSubject === true && strongIdentityType(c.signalType) && c.accountStatus !== "POSSIBLE") : [];
+  const floor: Confidence = exposed.some((c) => c.signalType === "real_name") && exposed.some((c) => c.signalType === "email") ? "high" :
+    exposed.length > 0 ? "medium" : "low";
+  const overallRisk = mapOverallRisk(finalClusters, uniqueContradictions, floor);
 
   const verdict = buildVerdict({
     overallRisk,
-    clusters: finalClusters,
+    clusters: subjectClusters,
     contradictionStrings: uniqueContradictions,
     evidenceValidation: structured?.evidenceValidation,
   });
@@ -1147,6 +1330,7 @@ function computeInner(
     contradictions: uniqueContradictions,
     warnings: [...new Set(warnings)].sort(),
     verdict,
+    rejectedAccounts,
   };
 }
 
@@ -1247,7 +1431,7 @@ function normalizeClaimValue(signalType: SignalType, claim: string): string {
  * ──────────────────────────────────────────────────────────────────────── */
 
 function emptyCorroboration(): CorroborationResult {
-  return { clusters: [], score: 0, overallRisk: "low", contradictions: [], warnings: [], verdict: emptyVerdict() };
+  return { clusters: [], score: 0, overallRisk: "low", contradictions: [], warnings: [], verdict: emptyVerdict(), rejectedAccounts: [] };
 }
 
 /**
@@ -1292,12 +1476,12 @@ const SIGNAL_LABEL: Record<SignalType, string> = {
 
 /** Render the corroboration result as a "## Cross-Signal Corroboration" block. */
 export function renderCorroborationBlock(result: CorroborationResult): string {
-  if (result.clusters.length === 0 && result.warnings.length === 0) return "";
+  if (result.clusters.length === 0 && result.warnings.length === 0 && result.rejectedAccounts.length === 0) return "";
   const lines: string[] = [];
   lines.push(`## Cross-Signal Corroboration`);
   lines.push("");
   lines.push(
-    `*Deterministic fusion pass (no LLM) — clusters independent signals that assert the same entity, counts corroborating sources across Reddit evidence, the web sweep, the GitHub pass, the Twitter pass, and regex identifiers, and emits calibrated confidence. ${result.clusters.length} cluster(s), ${result.contradictions.length} contradiction(s). Overall corroborated risk: ${RISK_BADGE[result.overallRisk]}. Exposure score: ${result.score}/100.*`,
+    `*Deterministic fusion pass (no LLM) — clusters independent signals that assert the same entity and counts each originating document once, even when several collectors read it. Account verification labels can only lower confidence. ${result.clusters.length} cluster(s), ${result.contradictions.length} contradiction(s). Overall corroborated risk: ${RISK_BADGE[result.overallRisk]}. Exposure score: ${result.score}/100.*`,
   );
   lines.push("");
 
@@ -1310,6 +1494,10 @@ export function renderCorroborationBlock(result: CorroborationResult): string {
   if (result.clusters.length > 0) {
     lines.push(`**Corroborated entities** (ranked: high → low confidence, then by source count)`);
     lines.push("");
+    if (result.clusters.some((c) => c.personId)) {
+      lines.push(`*Separate persons are excluded from the subject's score/verdict. A local-part match adds +1 confidence, not another source.*`);
+      lines.push("");
+    }
     lines.push(`| Confidence | Type | Value | Sources | Domains | Breakdown | Flags |`);
     lines.push(`|------------|------|-------|---------|---------|-----------|-------|`);
 
@@ -1329,6 +1517,7 @@ export function renderCorroborationBlock(result: CorroborationResult): string {
       if ((c.sourceBreakdown.twitter ?? 0) > 0) breakdownParts.push(`twitter ${c.sourceBreakdown.twitter}`);
 
       const flags: string[] = [];
+      if (c.isSubject === false) flags.push("separate person — excluded");
       if ((c.contradictions?.length ?? 0) > 0) {
         flags.push(`⚠️ conflict: ${c.contradictions![0]}`);
       }
@@ -1336,13 +1525,16 @@ export function renderCorroborationBlock(result: CorroborationResult): string {
         flags.push(`⚠️ ${c.warnings![0]}`);
       }
       if (c.signalType === "handle") {
+        if (c.accountStatus) flags.push(c.accountStatus);
         if (c.tier === "bridge") flags.push("🌉 bridge");
         else if (c.tier === "cross-platform cluster") flags.push("🔗 cluster");
       }
       if (c.signalType === "email" && !isEmptyBreakdown(c.sourceBreakdown)) {
         if (c.freemail === false) flags.push("🌐 custom domain");
+        if (c.emailLocalPartMatch) flags.push("local-part match (+1)");
       }
-      if (!c.corroborating) flags.push("single-source");
+      if (!c.independentSources) flags.push("unverified — zero weight");
+      else if (!c.corroborating) flags.push("single-source");
 
       const val = c.value.length > 60 ? `${c.value.slice(0, 57)}…` : c.value;
       lines.push(
@@ -1361,6 +1553,11 @@ export function renderCorroborationBlock(result: CorroborationResult): string {
     lines.push("");
     lines.push(`**⚠️ Warnings** (cautions only — do not affect the risk score)`);
     for (const w of result.warnings) lines.push(`- ${w}`);
+  }
+
+  if (result.rejectedAccounts.length > 0) {
+    lines.push("");
+    lines.push(`**Removed by REJECTED labels** (with every observation read off them): ${result.rejectedAccounts.join(", ")}`);
   }
 
   return lines.join("\n");

@@ -405,13 +405,18 @@ function commonPrefixLength(a: string, b: string): number {
  * Does a display name look like a real person's name (not a handle echo)?
  * ≥2 alphabetic tokens, at least one properly capitalized, and not just the
  * handle re-spelled. "Rohan Sharma" yes; "0x crypto whale" no; "rohan" no.
+ * Also gates GitHub profile/commit names in corroboration. Omit `screenName`
+ * there: a GitHub `name` field is a separate declaration even when the login
+ * was derived from it ("John Doe" / johndoe is a real name), and single-token
+ * echoes like "fixturenew" already fail the two-token rule.
  */
-function nameLooksReal(name: string, screenName: string): boolean {
+export function nameLooksReal(name: string, screenName?: string): boolean {
   const tokens = name
     .split(/\s+/)
     .map((t) => t.replace(/[^A-Za-zÀ-ž'-]/g, ""))
     .filter((t) => t.length >= 2);
   if (tokens.length < 2) return false;
+  if (screenName === undefined) return tokens.some((t) => /^[A-ZÀ-Ž]/.test(t));
   const stem = screenName.replace(/[._-]+/g, "").toLowerCase();
   if (tokens.join("").toLowerCase() === stem) return false;
   if (tokens.every((t) => t.toLowerCase() === screenName.toLowerCase())) return false;

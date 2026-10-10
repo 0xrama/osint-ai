@@ -114,9 +114,11 @@ describe("identity graph: subject fusion", () => {
 
     const anchor = graph.edges.find((e) => e.kind === "anchor-rename");
     expect(anchor).toBeDefined();
-    expect(anchor!.from).toBe("handle:dirpage");
+    expect(anchor!.from).toBe("handle:fixturenew");
     expect(anchor!.to).toBe("handle:fixtureveil");
     expect(anchor!.strength).toBe(1.0);
+    // The page owner only links the subject; it is not fused.
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).not.toContain("handle:dirpage");
   });
 });
 
@@ -147,6 +149,43 @@ describe("identity graph: namesakes", () => {
     expect(block).toContain("fixturefan");
     const promptCtx = renderIdentityGraphContextForPrompt(graph, "fixtureveil");
     expect(promptCtx).toContain("NOT u/fixtureveil");
+  });
+});
+
+describe("identity graph: same-string profile namesakes", () => {
+  // GitHub account whose login IS the audited username, located in Tokyo.
+  const sameLogin = (extra: Partial<IdentityGraphInput>, posts: string[]) =>
+    buildIdentityGraph({
+      username: "fixtureveil",
+      gitHub: makeGitHub({
+        identities: [{
+          login: "fixtureveil", url: "https://github.com/fixtureveil", email: "fixtureveil@corp.test",
+          location: "Tokyo, Japan", commitAuthors: [], commitStats: { scanned: 0, attributed: 0, excluded: 0 },
+        }],
+      }),
+      corpusTexts: posts.map((text, i) => ({ text, permalink: `/r/a/comments/${i}/` })),
+      ...extra,
+    });
+  const subjectEmails = (g: ReturnType<typeof buildIdentityGraph>) => g.persons.find((p) => p.isSubject)!.emailNodes;
+
+  test("username-only match contradicted by the corpus splits into a separate person", () => {
+    const graph = sameLogin({}, ["I live in Manchester these days"]);
+    expect(subjectEmails(graph)).not.toContain("email:fixtureveil@corp.test");
+    const namesake = graph.persons.find((p) => !p.isSubject && p.emailNodes.includes("email:fixtureveil@corp.test"));
+    expect(namesake?.handleNodes).toEqual(["handle:fixtureveil@github"]);
+  });
+
+  test("a corpus link to the account keeps it fused despite the contradiction", () => {
+    const graph = sameLogin(
+      { corpusIdentifiers: { emails: [], socialHandles: [{ platform: "github", handle: "fixtureveil", url: "https://github.com/fixtureveil" }] } },
+      ["I live in Manchester these days"],
+    );
+    expect(subjectEmails(graph)).toContain("email:fixtureveil@corp.test");
+  });
+
+  test("a consistent or silent corpus keeps it fused", () => {
+    expect(subjectEmails(sameLogin({}, ["I live in Tokyo now"]))).toContain("email:fixtureveil@corp.test");
+    expect(subjectEmails(sameLogin({}, ["nice weather"]))).toContain("email:fixtureveil@corp.test");
   });
 });
 
@@ -214,6 +253,34 @@ describe("identity graph: corpus disclosures", () => {
     });
 
     expect(graph.edges.filter((e) => e.kind === "disclosure")).toHaveLength(0);
+  });
+
+  test("a corpus email joins the subject person via a disclosure edge with the permalink as evidence", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      corpusIdentifiers: { emails: ["Veil@Shadow.dev"], socialHandles: [] },
+      corpusTexts: [
+        { text: "unrelated post", permalink: "/r/a/comments/1/" },
+        { text: "reach me at veil@shadow.dev", permalink: "/r/b/comments/2/" },
+      ],
+    });
+
+    const disclosure = edgeBetween(graph, "email:veil@shadow.dev", "handle:fixtureveil");
+    expect(disclosure?.kind).toBe("disclosure");
+    expect(disclosure?.strength).toBe(0.8);
+    expect(disclosure?.evidence).toEqual(["/r/b/comments/2/"]);
+    expect(graph.persons.find((p) => p.isSubject)?.emailNodes).toContain("email:veil@shadow.dev");
+  });
+
+  test("vendor and noreply corpus emails never join the subject", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      corpusIdentifiers: { emails: ["abuse@vendor.com", "noreply@vendor.com", "support@vendor.com"], socialHandles: [] },
+      corpusTexts: [{ text: "abuse@vendor.com noreply@vendor.com support@vendor.com", permalink: "/r/a/comments/1/" }],
+    });
+
+    expect(graph.edges.filter((e) => e.kind === "disclosure")).toHaveLength(0);
+    expect(graph.persons.find((p) => p.isSubject)?.emailNodes).toEqual([]);
   });
 });
 

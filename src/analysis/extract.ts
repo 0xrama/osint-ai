@@ -41,65 +41,65 @@ const SOCIAL_PATTERNS: Array<{
 }> = [
   {
     platform: "linkedin",
-    pattern: /https?:\/\/(?:[\w-]+\.)?linkedin\.com\/in\/([A-Za-z0-9_-]+)/gi,
+    pattern: /(?:https?:\/\/|(?<![\w.@/-]))(?:[\w-]+\.)?linkedin\.com\/in\/([A-Za-z0-9_-]+)/gi,
   },
   {
     platform: "x",
     pattern:
-      /https?:\/\/(?:www\.|mobile\.)?(?:twitter\.com|x\.com)\/([A-Za-z0-9_]+)(?=\b|\/|$)/gi,
+      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.|mobile\.)?(?:twitter\.com|x\.com)\/([A-Za-z0-9_]+)(?=\b|\/|$)/gi,
     reject:
       /^(home|search|explore|intent|share|hashtag|notifications|messages|settings|i|compose|login|signup|tos|privacy|about)$/i,
   },
   {
     platform: "github",
     pattern:
-      /https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})(?=\b|\/|$)/gi,
+      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})(?=\b|\/|$)/gi,
     reject:
       /^(issues|pull|search|trending|marketplace|orgs|topics|collections|notifications|settings|new|features|pricing|enterprise|sponsors|readme|about|contact|login|join|signup|security|nonprofit|customer-stories|events|codespaces|copilot)$/i,
   },
   {
     platform: "youtube",
     pattern:
-      /https?:\/\/(?:www\.)?youtube\.com\/(?:@|channel\/|user\/|c\/)([A-Za-z0-9_-]+)/gi,
+      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?youtube\.com\/(?:@|channel\/|user\/|c\/)([A-Za-z0-9_-]+)/gi,
   },
   {
     platform: "instagram",
     pattern:
-      /https?:\/\/(?:www\.)?instagram\.com\/([A-Za-z0-9_.]+)(?=\b|\/|$)/gi,
+      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?instagram\.com\/([A-Za-z0-9_.]+)(?=\b|\/|$)/gi,
     reject: /^(p|reel|tv|accounts|explore|stories|about|developer)$/i,
   },
   {
     platform: "bluesky",
-    pattern: /https?:\/\/(?:www\.)?bsky\.app\/profile\/([A-Za-z0-9_.:-]+)/gi,
+    pattern: /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?bsky\.app\/profile\/([A-Za-z0-9_.:-]+)/gi,
   },
   {
     platform: "reddit",
     pattern:
-      /https?:\/\/(?:www\.|old\.)?reddit\.com\/(?:u|user)\/([A-Za-z0-9_-]+)/gi,
+      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.|old\.)?reddit\.com\/(?:u|user)\/([A-Za-z0-9_-]+)/gi,
   },
   {
     platform: "hackernews",
-    pattern: /https?:\/\/news\.ycombinator\.com\/user\?id=([A-Za-z0-9_-]+)/gi,
+    pattern: /(?:https?:\/\/|(?<![\w.@/-]))news\.ycombinator\.com\/user\?id=([A-Za-z0-9_-]+)/gi,
   },
   {
     platform: "telegram",
-    pattern: /https?:\/\/(?:www\.)?t\.me\/([A-Za-z0-9_]+)/gi,
+    pattern: /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?t\.me\/([A-Za-z0-9_]+)/gi,
     reject: /^(joinchat|s)$/i,
   },
   {
     platform: "gitlab",
     pattern:
-      /https?:\/\/(?:www\.)?gitlab\.com\/([A-Za-z0-9][A-Za-z0-9_-]+)(?=\b|\/|$)/gi,
+      /(?:https?:\/\/|(?<![\w.@/-]))(?:www\.)?gitlab\.com\/([A-Za-z0-9][A-Za-z0-9_-]+)(?=\b|\/|$)/gi,
     reject: /^(explore|help|users|projects|search|public|dashboard|admin)$/i,
   },
   {
     platform: "stackoverflow",
-    pattern: /https?:\/\/stackoverflow\.com\/users\/(\d+)/gi,
+    pattern: /(?:https?:\/\/|(?<![\w.@/-]))stackoverflow\.com\/users\/(\d+)/gi,
   },
   {
     platform: "mastodon",
     pattern:
-      /https?:\/\/(mastodon\.[a-z.]+|mstdn\.[a-z.]+|fosstodon\.org|hachyderm\.io|infosec\.exchange)\/@([A-Za-z0-9_]+)/gi,
+      /(?:https?:\/\/|(?<![\w.@/-]))(mastodon\.[a-z.]+|mstdn\.[a-z.]+|fosstodon\.org|hachyderm\.io|infosec\.exchange)\/@([A-Za-z0-9_]+)/gi,
   },
 ];
 
