@@ -95,6 +95,36 @@ describe("runArchivePass (parsing)", () => {
   });
 });
 
+describe("runArchivePass (bounded concurrency)", () => {
+  test("random delays give the same snapshots (and order) as zero delay, with overlap", async () => {
+    const byPattern = {
+      "x.com/fixtureone": [CDX_HEADER, ["x.com/fixtureone", "20230101000000", "https://x.com/fixtureone", "text/html", "200", "x", "1"]],
+      "twitter.com/fixtureone": CDX_TWITTER,
+      "github.com/fixtureone": CDX_GITHUB,
+      "t.me/fixturetwo": [CDX_HEADER, ["t.me/fixturetwo", "20200101000000", "https://t.me/fixturetwo", "text/html", "200", "t", "1"]],
+    };
+    const baseline = await runArchivePass(["fixtureone", "fixturetwo"], { deps: { fetchJson: cdxRoute(byPattern) } });
+    let inFlight = 0;
+    let peak = 0;
+    const route = cdxRoute(byPattern);
+    const res = await runArchivePass(["fixtureone", "fixturetwo"], {
+      deps: {
+        fetchJson: async (url) => {
+          inFlight++;
+          peak = Math.max(peak, inFlight);
+          await Bun.sleep(Math.random() * 5);
+          inFlight--;
+          return route(url);
+        },
+      },
+    });
+    expect(res).toEqual(baseline);
+    expect(res.snapshots.map((s) => s.url)).toEqual(["x.com/fixtureone", "twitter.com/fixtureone/", "github.com/fixtureone", "t.me/fixturetwo"]);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(3);
+  });
+});
+
 describe("renderers", () => {
   const CAKE_DAY_2020 = Math.floor(Date.UTC(2020, 0, 1) / 1000);
 

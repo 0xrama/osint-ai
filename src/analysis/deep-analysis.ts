@@ -1100,7 +1100,7 @@ async function runSynthesisAgent(
     systemPrompt: finalSystem,
     userPrompt,
     tools,
-    maxIterations: useWeb ? 16 : 6,
+    maxIterations: useWeb ? SYNTHESIS_MAX_ITERATIONS_WEB : 6,
     callbacks: {
       onToolCall: (name, args) => {
         const detail =
@@ -1119,6 +1119,11 @@ async function runSynthesisAgent(
 
   return run.text;
 }
+
+/** Synthesis tool-loop cap with web tools. Deterministic leads arrive as
+ *  ground truth, so the agent only verifies — and on CLI backends every
+ *  iteration is a cold `claude -p` spawn (16 was mostly idle overhead). */
+const SYNTHESIS_MAX_ITERATIONS_WEB = 10;
 
 // ── Main pipeline entry point ─────────────────────────────────────────────
 
@@ -1139,6 +1144,8 @@ export interface DeepAnalysisResult {
     total_items_filtered: number;
     items_per_domain: Record<string, number>;
     total_duration_ms: number;
+    /** Wall-clock ms per stage (sub-agents / synthesis / findings). */
+    phase_ms: Record<string, number>;
     model_used: string;
   };
 }
@@ -1255,6 +1262,7 @@ export async function runDeepAnalysis(
     `[3/4] Dispatching ${DOMAINS.length} specialized sub-agents in parallel...\n`,
   );
 
+  const subAgentsStart = Date.now();
   const subResults: SubAgentResult[] = await Promise.all(
     DOMAINS.map((domain) => {
       const items = buckets.get(domain.id) ?? [];
@@ -1265,7 +1273,9 @@ export async function runDeepAnalysis(
   onProgress?.(`\n   ✅ All ${subResults.length} sub-agents completed`);
 
   // Step 4: Run synthesis agent
+  const subAgentsMs = Date.now() - subAgentsStart;
   onProgress?.(`\n[4/4] Running synthesis agent...\n`);
+  const synthesisStart = Date.now();
   const synthesisReport = await runSynthesisAgent(
     username,
     subResults,
@@ -1275,6 +1285,7 @@ export async function runDeepAnalysis(
     options.webContextText,
   );
 
+  const synthesisMs = Date.now() - synthesisStart;
   const totalDurationMs = Date.now() - pipelineStart;
   onProgress?.(`\n${"━".repeat(60)}`);
   onProgress?.(
@@ -1304,6 +1315,7 @@ export async function runDeepAnalysis(
   // carries zero weight downstream (corroboration counts only surviving
   // permalinks).
   let structured: StructuredFindings | undefined;
+  const findingsStart = Date.now();
   try {
     structured = await extractStructuredFindings(
       synthesisReport,
@@ -1319,6 +1331,7 @@ export async function runDeepAnalysis(
   } catch (err: any) {
     onProgress?.(`[findings] Structured extraction failed: ${err?.message ?? err}`);
   }
+  const findingsMs = Date.now() - findingsStart;
 
   return {
     username,
@@ -1332,6 +1345,7 @@ export async function runDeepAnalysis(
       total_items_filtered: kept.length,
       items_per_domain: itemsPerDomain,
       total_duration_ms: totalDurationMs,
+      phase_ms: { "sub-agents": subAgentsMs, synthesis: synthesisMs, findings: findingsMs },
       model_used: subResults[0]?.modelId ?? "unknown",
     },
   };

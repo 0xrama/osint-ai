@@ -70,6 +70,36 @@ export interface AuditResult {
 	brief?: string;
 	/** Combined machine-readable shape for --json output. */
 	json?: any;
+	/** Wall-clock duration per pipeline phase (ms). Concurrent phases overlap. */
+	phaseMs?: Record<string, number>;
+}
+
+/**
+ * Tiny phase timer for runAudit: `time(name, fn)` awaits fn, records its
+ * wall-clock span (even when it throws) and logs it. Phases that run
+ * concurrently each record their own span, so the sum can exceed elapsed time.
+ */
+export function phaseTimer(log: (message: string) => void) {
+	const ms: Record<string, number> = {};
+	const time = async <T>(name: string, fn: () => T | Promise<T>): Promise<T> => {
+		const start = Date.now();
+		try {
+			return await fn();
+		} finally {
+			ms[name] = Date.now() - start;
+			log(`[timing] ${name}: ${(ms[name] / 1000).toFixed(1)}s`);
+		}
+	};
+	return { ms, time };
+}
+
+/** One-line summary of the `n` slowest phases, e.g. "synthesis 312.4s, web sweep 98.0s". */
+export function slowestPhases(ms: Record<string, number>, n = 3): string {
+	return Object.entries(ms)
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, n)
+		.map(([name, d]) => `${name} ${(d / 1000).toFixed(1)}s`)
+		.join(", ");
 }
 
 /** Strip light markdown (bold/italic/code/links) for clean terminal display. */
@@ -351,6 +381,17 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// Person-level identity graph (built twice: pre-synthesis for namesake
 	// ground truth, post-corpus for the full report block).
 	let identityGraph: IdentityGraph | undefined;
+	const { ms: phaseMs, time } = phaseTimer(log);
+
+	// ── Reddit corpus download (started now, awaited before analysis) ──
+	// Depends only on the username/window, not on any web/GitHub/Twitter lead,
+	// so it overlaps the deterministic passes below. Its lines carry their own
+	// [local]/[download] prefixes. Never rejects: a failure degrades to the
+	// live-agent fallback exactly like a failed download.
+	const localPromise = time("corpus download", () => ensureLocalData(username, years, dataDir, log)).catch((err: any) => {
+		log(`[local] Corpus download failed (continuing): ${err?.message ?? err}`);
+		return null;
+	});
 
 	// ── Deterministic web sweep (run EARLY) ──
 	// Run before analysis so the synthesis/live agent can REASON about the
@@ -364,7 +405,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		status(`🔎 Deterministic web sweep for u/${username}...`);
 		log(`\n🔎 Deterministic web sweep for u/${username}`);
 		try {
-			webSweep = await runDeterministicWebSweep(username, (msg) => { status(msg); log(msg); });
+			webSweep = await time("web sweep", () => runDeterministicWebSweep(username, (msg) => { status(msg); log(msg); }));
 			webSweepContextText = renderWebContextForPrompt(webSweep);
 			webContextText = webSweepContextText;
 			if (webContextText) {
@@ -375,78 +416,80 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		}
 	}
 
-	// ── Deterministic GitHub pass (runs on the sweep's ranked handles) ──
-	// The GitHub REST API yields what no scraper reliably gets: real-name
-	// fields and git commit-author name+email pairs. Depends only on the
-	// audited username + sweep output, NOT on Firecrawl — runs even if the
-	// Firecrawl path above failed, as long as --web is set.
-	let gitHub: GitHubPassResult | undefined;
-	if (web) {
+	// ── Deterministic GitHub + Twitter passes (concurrent) ──
+	// Both are seeded from the sweep alone (audited username + bridge owners +
+	// multi-platform ranked handles) and neither reads the other's output, so
+	// they run side by side. Each catches its own failure and resolves to
+	// undefined, so Promise.all never rejects. Twitter context is appended
+	// after both settle, keeping the prompt block order unchanged.
+	const crossSeeds = [
+		username,
+		// Bridge owner handles (the CURRENT identity from stale cross-references,
+		// e.g. fixturenew when the audited user is fixtureveil) are the
+		// highest-priority probes — their profile may expose real name, email,
+		// and linked accounts pointing back to the audited username.
+		...(webSweep?.bridgeOwnerHandles ?? []),
+		...rankHandles(
+			webSweep?.identifiers.socialHandles ?? [],
+			username,
+			webSweep?.bridgeEvidence,
+		).filter((r) => r.tier !== "single platform").map((r) => r.handle),
+	];
+
+	// GitHub: the REST API yields what no scraper reliably gets — real-name
+	// fields and git commit-author name+email pairs. NOT Firecrawl-dependent:
+	// runs even if the sweep failed, as long as --web is set. Context is
+	// rendered once, after the alt-lead and corpus re-probes merge in.
+	const gitHubPass = async (): Promise<GitHubPassResult | undefined> => {
+		if (!web) return undefined;
 		try {
-			const ranked = rankHandles(
-				webSweep?.identifiers.socialHandles ?? [],
-				username,
-				webSweep?.bridgeEvidence,
-			);
-			// Bridge owner handles (the CURRENT identity from stale cross-references,
-			// e.g. fixturenew when the audited user is fixtureveil) are the highest-priority
-			// GitHub probes — their profile may expose real name, email, and linked
-			// Twitter pointing back to the audited username.
-			const seeds = [
-				username,
-				...(webSweep?.bridgeOwnerHandles ?? []),
-				...ranked.filter((r) => r.tier !== "single platform").map((r) => r.handle),
-			];
-			status(`🐙 GitHub identity pass over ${seeds.length} handle(s)...`);
-			// Context is rendered once, after the alt-lead and corpus re-probes merge in.
-			gitHub = await runGitHubPass(seeds, {}, (msg) => { status(msg); log(msg); });
+			status(`🐙 GitHub identity pass over ${crossSeeds.length} handle(s)...`);
+			return await time("github pass", () => runGitHubPass(crossSeeds, {}, (msg) => { status(msg); log(msg); }));
 		} catch (err: any) {
 			log(`[github-pass] Failed (continuing without GitHub leads): ${err?.message ?? err}`);
+			return undefined;
 		}
-	}
+	};
 
-	// ── Deterministic Twitter pass (opt-in --twitter; independent of Firecrawl) ──
-	// Runs when --twitter is set AND the operator's twitter-cli reports an
-	// authenticated session (status --json → ok:true). Reads profile fields,
+	// Twitter (opt-in --twitter): runs when the operator's twitter-cli reports
+	// an authenticated session (status --json → ok:true). Reads profile fields,
 	// follow-graph alt-account candidates, and their websites via the burner
-	// account — read-only by construction. Seeded with the same ranked handles
-	// as the GitHub pass (plus the audited username), so the deepest probes
-	// converge on the bridge-owner (current identity) handles.
-	let twitter: TwitterPassResult | undefined;
-	if (useTwitter) {
+	// account — read-only by construction.
+	const twitterPass = async (): Promise<TwitterPassResult | undefined> => {
+		if (!useTwitter) return undefined;
 		try {
 			status(`🐦 Checking twitter-cli availability...`);
 			const available = await twitterAvailable();
 			if (!available) {
 				log(`[twitter-pass] twitter-cli unavailable or unauthenticated — skipping. Install it (uv tool install twitter-cli) and log in with the burner account (TWITTER_AUTH_TOKEN/TWITTER_CT0 env vars or browser cookies).`);
-			} else {
-				const twSeeds = [
-					username,
-					...(webSweep?.bridgeOwnerHandles ?? []),
-					...rankHandles(
-						webSweep?.identifiers.socialHandles ?? [],
-						username,
-						webSweep?.bridgeEvidence,
-					).filter((r) => r.tier !== "single platform").map((r) => r.handle),
-				];
-				status(`🐦 Twitter identity pass over ${twSeeds.length} handle(s)...`);
-				twitter = await runTwitterPass(
-					twSeeds,
-					{
-						subjectCreatedISO: webSweep?.redditProfile?.createdUtc
-							? new Date(webSweep.redditProfile.createdUtc * 1000).toISOString()
-							: undefined,
-					},
-					(msg) => { status(msg); log(msg); },
-				);
-				const twCtx = renderTwitterContextForPrompt(twitter);
-				if (twCtx) {
-					webContextText = `${webContextText}${twCtx}`;
-					log(`[twitter-pass] Injecting ${twitter.results.filter((r) => r.profile).length} profile(s) + ${twitter.results.reduce((n, r) => n + r.altCandidates.length, 0)} alt candidate(s) into analysis as ground truth.`);
-				}
+				return undefined;
 			}
+			status(`🐦 Twitter identity pass over ${crossSeeds.length} handle(s)...`);
+			return await time("twitter pass", () => runTwitterPass(
+				crossSeeds,
+				{
+					subjectCreatedISO: webSweep?.redditProfile?.createdUtc
+						? new Date(webSweep.redditProfile.createdUtc * 1000).toISOString()
+						: undefined,
+				},
+				(msg) => { status(msg); log(msg); },
+			));
 		} catch (err: any) {
 			log(`[twitter-pass] Failed (continuing without Twitter leads): ${err?.message ?? err}`);
+			return undefined;
+		}
+	};
+
+	let [gitHub, twitter] = await Promise.all([gitHubPass(), twitterPass()]);
+	if (twitter) {
+		try {
+			const twCtx = renderTwitterContextForPrompt(twitter);
+			if (twCtx) {
+				webContextText = `${webContextText}${twCtx}`;
+				log(`[twitter-pass] Injecting ${twitter.results.filter((r) => r.profile).length} profile(s) + ${twitter.results.reduce((n, r) => n + r.altCandidates.length, 0)} alt candidate(s) into analysis as ground truth.`);
+			}
+		} catch (err: any) {
+			log(`[twitter-pass] Context render failed (continuing): ${err?.message ?? err}`);
 		}
 	}
 
@@ -462,41 +505,43 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		)].filter((h) => !h.toLowerCase().startsWith("@"));
 
 		if (altLeadHandles.length > 0) {
-			log(`[loop] Alt-lead handles from Twitter follow-graph: [${altLeadHandles.join(", ")}]`);
+			await time("alt-lead closure", async () => {
+				log(`[loop] Alt-lead handles from Twitter follow-graph: [${altLeadHandles.join(", ")}]`);
 
-			// GitHub: probe the alt leads for real-name / commit-email leaks.
-			try {
-				const extraGh = await runGitHubPass(altLeadHandles, {}, (msg) => { status(msg); log(msg); });
-				if (extraGh.identities.length > 0) {
-					gitHub = mergeGitHubPass(gitHub, extraGh);
-					log(`[loop] GitHub pass over alt leads found ${extraGh.identities.length} identit(ies).`);
+				// GitHub: probe the alt leads for real-name / commit-email leaks.
+				try {
+					const extraGh = await runGitHubPass(altLeadHandles, {}, (msg) => { status(msg); log(msg); });
+					if (extraGh.identities.length > 0) {
+						gitHub = mergeGitHubPass(gitHub, extraGh);
+						log(`[loop] GitHub pass over alt leads found ${extraGh.identities.length} identit(ies).`);
+					}
+				} catch (err: any) {
+					log(`[loop] Alt-lead GitHub pass failed (continuing): ${err?.message ?? err}`);
 				}
-			} catch (err: any) {
-				log(`[loop] Alt-lead GitHub pass failed (continuing): ${err?.message ?? err}`);
-			}
 
-			// Web sweep: re-sweep each alt lead (single round, no snowball) and
-			// merge the identifiers/bridges back into the primary sweep.
-			if (web && sweepCapable()) {
-				for (const lead of altLeadHandles) {
-					try {
-						const extraSweep = await runDeterministicWebSweep(lead, (msg) => { status(msg); log(msg); }, { maxRounds: 1 });
-						webSweep = webSweep ? mergeWebSweep(webSweep, extraSweep) : extraSweep;
-					} catch (err: any) {
-						log(`[loop] Alt-lead web sweep failed for ${lead} (continuing): ${err?.message ?? err}`);
+				// Web sweep: re-sweep each alt lead (single round, no snowball) and
+				// merge the identifiers/bridges back into the primary sweep.
+				if (web && sweepCapable()) {
+					for (const lead of altLeadHandles) {
+						try {
+							const extraSweep = await runDeterministicWebSweep(lead, (msg) => { status(msg); log(msg); }, { maxRounds: 1 });
+							webSweep = webSweep ? mergeWebSweep(webSweep, extraSweep) : extraSweep;
+						} catch (err: any) {
+							log(`[loop] Alt-lead web sweep failed for ${lead} (continuing): ${err?.message ?? err}`);
+						}
+					}
+					const mergedSweepCtx = webSweep ? renderWebContextForPrompt(webSweep) : "";
+					if (mergedSweepCtx) {
+						// Replace the original sweep context block with the merged one so
+						// the agent sees the expanded graph (rather than appending dupes).
+						webContextText = webContextText.replace(webSweepContextText, mergedSweepCtx);
+						if (!webContextText.includes(mergedSweepCtx)) {
+							webContextText = `${webContextText}${mergedSweepCtx}`;
+						}
+						webSweepContextText = mergedSweepCtx;
 					}
 				}
-				const mergedSweepCtx = webSweep ? renderWebContextForPrompt(webSweep) : "";
-				if (mergedSweepCtx) {
-					// Replace the original sweep context block with the merged one so
-					// the agent sees the expanded graph (rather than appending dupes).
-					webContextText = webContextText.replace(webSweepContextText, mergedSweepCtx);
-					if (!webContextText.includes(mergedSweepCtx)) {
-						webContextText = `${webContextText}${mergedSweepCtx}`;
-					}
-					webSweepContextText = mergedSweepCtx;
-				}
-			}
+			});
 		}
 	}
 
@@ -516,31 +561,45 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 			).filter((r) => r.tier !== "single platform").map((r) => r.handle),
 		])];
 		const subjectCreatedUtc = webSweep?.redditProfile?.createdUtc;
+		// Independent of each other (same seeds, no shared output): run both,
+		// each resolving to undefined on failure, then append their context in
+		// the original order — probes block, then archive block.
+		const probesPass = async (): Promise<ExistenceProbeResult | undefined> => {
+			try {
+				status(`📡 Username existence probes over ${Math.min(3, probeSeeds.length)} handle(s)...`);
+				const result = await time("existence probes", () => runExistenceProbes(probeSeeds, {}, (msg) => { status(msg); log(msg); }));
+				const hits = result.probes.filter((p) => p.outcome === "exists").length;
+				if (hits > 0) log(`[probes] ${hits} profile(s) exist for probed handles.`);
+				return result;
+			} catch (err: any) {
+				log(`[probes] Existence probes failed (continuing): ${err?.message ?? err}`);
+				return undefined;
+			}
+		};
+		const archiveRun = async (): Promise<ArchivePassResult | undefined> => {
+			try {
+				status(`🕰️ Wayback archive pass over top handle(s)...`);
+				const result = await time("archive pass", () => runArchivePass(probeSeeds, { subjectCreatedUtc }, (msg) => { status(msg); log(msg); }));
+				if (result.snapshots.length > 0) log(`[archive] ${result.snapshots.length} archived profile URL(s) found.`);
+				return result;
+			} catch (err: any) {
+				log(`[archive] Archive pass failed (continuing): ${err?.message ?? err}`);
+				return undefined;
+			}
+		};
+		[existenceProbes, archivePass] = await Promise.all([probesPass(), archiveRun()]);
 		try {
-			status(`📡 Username existence probes over ${Math.min(3, probeSeeds.length)} handle(s)...`);
-			existenceProbes = await runExistenceProbes(probeSeeds, {}, (msg) => { status(msg); log(msg); });
-			const hits = existenceProbes.probes.filter((p) => p.outcome === "exists").length;
-			if (hits > 0) log(`[probes] ${hits} profile(s) exist for probed handles.`);
-			const ctx = renderExistenceProbeContextForPrompt(existenceProbes);
-			if (ctx) webContextText = `${webContextText}${ctx}`;
-		} catch (err: any) {
-			log(`[probes] Existence probes failed (continuing): ${err?.message ?? err}`);
-		}
-		try {
-			status(`🕰️ Wayback archive pass over top handle(s)...`);
-			archivePass = await runArchivePass(probeSeeds, { subjectCreatedUtc }, (msg) => { status(msg); log(msg); });
-			if (archivePass.snapshots.length > 0) {
-				log(`[archive] ${archivePass.snapshots.length} archived profile URL(s) found.`);
-				const ctx = renderArchiveContextForPrompt(archivePass, subjectCreatedUtc);
-				if (ctx) webContextText = `${webContextText}${ctx}`;
+			if (existenceProbes) webContextText = `${webContextText}${renderExistenceProbeContextForPrompt(existenceProbes)}`;
+			if (archivePass && archivePass.snapshots.length > 0) {
+				webContextText = `${webContextText}${renderArchiveContextForPrompt(archivePass, subjectCreatedUtc)}`;
 			}
 		} catch (err: any) {
-			log(`[archive] Archive pass failed (continuing): ${err?.message ?? err}`);
+			log(`[probes] Context render failed (continuing): ${err?.message ?? err}`);
 		}
 	}
 
 	status(`Preparing deep scan for u/${username}...`);
-	const local = await ensureLocalData(username, years, dataDir, log);
+	const local = await localPromise;
 
 	// Raw pre-filter item texts + regex identifiers from the subject's own posts,
 	// shared by the GitHub re-probe, both identity-graph builds and corroboration:
@@ -570,7 +629,8 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 			)].filter((h) => !queried.has(h.toLowerCase()));
 			if (corpusGhHandles.length > 0) {
 				log(`[github-pass] Probing corpus-disclosed GitHub handle(s): [${corpusGhHandles.join(", ")}]`);
-				gitHub = mergeGitHubPass(gitHub, await runGitHubPass(corpusGhHandles, {}, (msg) => { status(msg); log(msg); }));
+				const corpusGh = await time("corpus github re-probe", () => runGitHubPass(corpusGhHandles, {}, (msg) => { status(msg); log(msg); }));
+				gitHub = mergeGitHubPass(gitHub, corpusGh);
 			}
 		} catch (err: any) {
 			log(`[github-pass] Corpus-handle pass failed (continuing): ${err?.message ?? err}`);
@@ -639,7 +699,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 
 	if (local) {
 		log(`\n🔬 Multi-Agent Deep Analysis: ${local.posts.length} posts + ${local.comments.length} comments\n`);
-		const result = await runDeepAnalysis(username, local.posts, local.comments, candidate, (msg) => {
+		const result = await time("deep analysis", () => runDeepAnalysis(username, local.posts, local.comments, candidate, (msg) => {
 			status(msg);
 			log(msg);
 		}, {
@@ -654,7 +714,8 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 				...(gitHub?.identities ?? []).map((i) => i.login),
 				...altLeadHandles,
 			],
-		});
+		}));
+		for (const [phase, ms] of Object.entries(result.stats.phase_ms)) phaseMs[`deep: ${phase}`] = ms;
 		content = formatDeepAnalysisReport(result);
 		toolCalls = 0;
 		iterations = result.subAgentResults.length;
@@ -665,7 +726,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		log(`\n📄 Deep analysis complete — ${result.subAgentResults.length} sub-agents in ${(result.stats.total_duration_ms / 1000).toFixed(1)}s`);
 	} else {
 		log(`[deep] No local data; falling back to live agent scan...`);
-		const live = await runLiveAgent(opts, callbacks, webContextText);
+		const live = await time("live agent", () => runLiveAgent(opts, callbacks, webContextText));
 		content = live.content;
 		toolCalls = live.toolCalls;
 		iterations = live.iterations;
@@ -752,14 +813,14 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// Corroboration needs the final person ownership before clustering, including
 	// handles the subject disclosed in the corpus. Rendering stays after scoring.
 	try {
-		identityGraph = buildIdentityGraph({
+		identityGraph = await time("identity graph", () => buildIdentityGraph({
 			username,
 			webSweep,
 			gitHub,
 			twitter,
 			corpusIdentifiers,
 			corpusTexts: corpusItems,
-		});
+		}));
 		const subject = identityGraph.persons.find((p) => p.isSubject);
 		log(`[graph] ${identityGraph.persons.length} person entit(ies); subject confidence=${subject?.confidence ?? "n/a"} with ${subject?.handleNodes.length ?? 0} handle(s).`);
 	} catch (err: any) {
@@ -772,7 +833,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// is counted under exactly one domain, never two. Pure + never throws.
 	let corroboration: CorroborationResult | undefined;
 	try {
-		corroboration = computeCorroboration({
+		corroboration = await time("corroboration", () => computeCorroboration({
 			username,
 			identityGraph,
 			structured,
@@ -781,7 +842,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 			gitHub,
 			twitter,
 			corpusTexts: corpusItems,
-		});
+		}));
 		const block = renderCorroborationBlock(corroboration);
 		if (block) content = `${content}\n\n---\n${block}`;
 
@@ -799,6 +860,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	} catch (err: any) {
 		log(`[corroboration] Failed (continuing without corroboration layer): ${err?.message ?? err}`);
 	}
+	log(`[timing] Slowest phases: ${slowestPhases(phaseMs)}`);
 
 	const candidateCheck = checkCandidateHypothesis(candidate, corroboration);
 	if (candidateCheck) {
@@ -834,6 +896,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		structured,
 		corroboration,
 		verdict: corroboration?.verdict,
+		phaseMs,
 		content,
 	};
 
@@ -852,5 +915,6 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 		verdict: corroboration?.verdict,
 		brief,
 		json,
+		phaseMs,
 	};
 }

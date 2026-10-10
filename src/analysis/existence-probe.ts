@@ -29,6 +29,8 @@
  * "unknown": one flaky site must never abort the pass.
  */
 
+import { mapLimit } from "../runtime/concurrency.ts";
+
 export type ProbeOutcome = "exists" | "absent" | "unknown";
 
 /** One curated probe target. Only sites where a plain unauthenticated GET
@@ -117,7 +119,7 @@ export interface ExistenceProbeDeps {
 
 const UA = "osint-ai/2.0 (research; existence probe)";
 const TIMEOUT_MS = 8_000;
-/** Small worker pool: keeps at most 4 requests in flight (well under the ~8
+/** Bounded concurrency: keeps at most 4 requests in flight (well under the ~8
  *  politeness ceiling) while still finishing 25 targets × 3 handles quickly. */
 const CONCURRENCY = 4;
 const BODY_READ_LIMIT = 4096;
@@ -195,43 +197,34 @@ export async function runExistenceProbes(
   }
   const probeHandles = [...seen.values()].slice(0, maxHandles);
 
-  // Deterministic task order: handle order (input) × target order (table).
-  // Results are written into a preallocated array by task index so completion
-  // order can never shuffle the output.
+  // Deterministic task order: handle order (input) × target order (table);
+  // mapLimit returns results in task order, so completion order never
+  // shuffles the output.
   const tasks: Array<{ handle: string; target: ProbeTarget }> = [];
   for (const handle of probeHandles) {
     for (const target of PROBE_TARGETS) tasks.push({ handle, target });
   }
-  const probes: ExistenceProbeResult["probes"] = new Array(tasks.length);
 
   onProgress?.(
     `[existence-probe] Probing ${probeHandles.length} handle(s) across ${PROBE_TARGETS.length} platforms...`,
   );
 
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < tasks.length) {
-      const i = next++;
-      const { handle, target } = tasks[i];
-      const url = target.urlFor(handle);
-      // Per-probe resilience: any failure (throw or status 0) → unknown.
-      try {
-        const { status, body } = await fetchText(url);
-        probes[i] = {
-          platform: target.platform,
-          handle,
-          url,
-          outcome: classify(status, body, target),
-          httpStatus: status,
-        };
-      } catch {
-        probes[i] = { platform: target.platform, handle, url, outcome: "unknown", httpStatus: 0 };
-      }
+  const probes: ExistenceProbeResult["probes"] = await mapLimit(tasks, CONCURRENCY, async ({ handle, target }) => {
+    const url = target.urlFor(handle);
+    // Per-probe resilience: any failure (throw or status 0) → unknown.
+    try {
+      const { status, body } = await fetchText(url);
+      return {
+        platform: target.platform,
+        handle,
+        url,
+        outcome: classify(status, body, target),
+        httpStatus: status,
+      };
+    } catch {
+      return { platform: target.platform, handle, url, outcome: "unknown" as const, httpStatus: 0 };
     }
-  };
-  await Promise.all(
-    Array.from({ length: Math.min(CONCURRENCY, Math.max(tasks.length, 1)) }, () => worker()),
-  );
+  });
 
   const exists = probes.filter((p) => p.outcome === "exists").length;
   onProgress?.(`[existence-probe] Done: ${exists} exists / ${probes.length - exists} absent-or-unknown.`);

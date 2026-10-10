@@ -23,7 +23,16 @@
  * All errors are swallowed per-request: a 404 (handle not on GitHub) or a rate
  * limit must never abort a run. On 403/429 the pass records `rateLimited` and
  * stops politely instead of hammering the API.
+ *
+ * Logins and repos are fetched with small bounded concurrency (`mapLimit`),
+ * but results are assembled serially in input order, so output — including
+ * where a rate limit cuts the pass off — matches a one-at-a-time run.
  */
+
+import { mapLimit } from "../runtime/concurrency.ts";
+
+const LOGIN_CONCURRENCY = 3;
+const REPO_CONCURRENCY = 3;
 
 export interface GitHubCommitAuthor {
   name: string;
@@ -170,14 +179,17 @@ async function fetchCommitAuthors(
     .filter((r: any) => !r?.fork && typeof r?.full_name === "string")
     .slice(0, reposPerUser) as Array<{ full_name: string }>;
 
+  const commitResponses = await mapLimit(repos, REPO_CONCURRENCY, (repo) =>
+    ghGetFn(`https://api.github.com/repos/${repo.full_name}/commits?per_page=${commitsPerRepo}`),
+  );
+
+  // `seen` dedupe is order-sensitive: apply it serially in repo order.
   const seen = new Set<string>();
   const out: GitHubCommitAuthor[] = [];
   let scanned = 0;
   let excluded = 0;
-  for (const repo of repos) {
-    const commitsRes = await ghGetFn(
-      `https://api.github.com/repos/${repo.full_name}/commits?per_page=${commitsPerRepo}`,
-    );
+  for (const [i, repo] of repos.entries()) {
+    const commitsRes = commitResponses[i];
     if (!commitsRes?.json || !Array.isArray(commitsRes.json)) continue;
     const pick = selectOwnerCommits(commitsRes.json, login, repo.full_name, seen);
     out.push(...pick.authors);
@@ -274,20 +286,43 @@ export async function runGitHubPass(
 
   const doGhGet = opts.deps?.ghGet ?? ghGet;
 
-  for (const login of logins) {
+  // Index of the first login whose user fetch failed (null) or was
+  // rate-limited. Logins after it never start new requests; logins before it
+  // always run to completion, so the in-order walk below reproduces the
+  // serial pass exactly.
+  let stopAt = logins.length;
+  type LoginOutcome =
+    | { kind: "stop"; rateLimited: boolean }
+    | { kind: "skip" }
+    | { kind: "found"; u: any; commitAuthors: GitHubCommitAuthor[]; commitStats: GitHubIdentity["commitStats"] };
+  const outcomes = await mapLimit(logins, LOGIN_CONCURRENCY, async (login, i): Promise<LoginOutcome> => {
+    if (i > stopAt) return { kind: "skip" };
     const userRes = await doGhGet(
       `https://api.github.com/users/${encodeURIComponent(login)}`,
     );
-    if (!userRes) return { queried: logins, identities, rateLimited };
-    if (userRes.status === 403 || userRes.status === 429) {
-      rateLimited = true;
-      onProgress?.(`[github-pass] Rate-limited by GitHub (60 req/h unauth); set GITHUB_TOKEN to raise the cap.`);
-      return { queried: logins, identities, rateLimited };
+    const limited = userRes?.status === 403 || userRes?.status === 429;
+    if (!userRes || limited) {
+      stopAt = Math.min(stopAt, i);
+      return { kind: "stop", rateLimited: limited };
     }
-    if (userRes.status !== 200 || !userRes.json) continue; // 404: not on GitHub
-
-    const u = userRes.json;
+    if (userRes.status !== 200 || !userRes.json) return { kind: "skip" }; // 404: not on GitHub
+    if (i > stopAt) return { kind: "skip" };
     const { authors: commitAuthors, stats: commitStats } = await fetchCommitAuthors(login, reposPerUser, 8, doGhGet);
+    return { kind: "found", u: userRes.json, commitAuthors, commitStats };
+  });
+
+  for (const [i, login] of logins.entries()) {
+    const outcome = outcomes[i];
+    if (outcome.kind === "stop") {
+      if (outcome.rateLimited) {
+        rateLimited = true;
+        onProgress?.(`[github-pass] Rate-limited by GitHub (60 req/h unauth); set GITHUB_TOKEN to raise the cap.`);
+      }
+      break;
+    }
+    if (outcome.kind === "skip") continue;
+
+    const { u, commitAuthors, commitStats } = outcome;
     identities.push({
       login: String(u.login ?? login),
       url: String(u.html_url ?? `https://github.com/${login}`),

@@ -46,6 +46,7 @@ import {
 } from "./extract.ts";
 import { generateDriftVariants, groupDriftKeys } from "./handle-drift.ts";
 import { followWebsite } from "./site-follower.ts";
+import { mapLimit } from "../runtime/concurrency.ts";
 
 /** One stale-cross-reference edge: the page at `url` (owned by the bridge
  * owner this entry is keyed under) mentions `target` (the old/known handle).
@@ -188,6 +189,12 @@ function buildBridgeOwnerQueries(handle: string): string[] {
     `${q} portfolio OR about OR contact OR email`,
     `${handle} github OR twitter OR instagram OR youtube OR linkedin OR telegram OR tiktok`,
   ];
+}
+
+/** Flatten seeds × their query battery into one ordered search batch, so a
+ * whole round's queries can be in flight together. */
+function searchJobs(seeds: string[], build: (seed: string) => string[]): Array<{ seed: string; query: string }> {
+  return seeds.flatMap((seed) => build(seed).map((query) => ({ seed, query })));
 }
 
 /** Does this search result mention the seed string (case-insensitive, anywhere)? */
@@ -528,6 +535,10 @@ function urlsInText(text: string): string[] {
 
 const SWEEP_UA = "osint-ai/2.0 (research; web identity sweep)";
 
+/** In-flight Firecrawl searches/scrapes per batch. Results are applied in
+ * input order afterwards, so this changes wall time, never the output. */
+const SWEEP_CONCURRENCY = 4;
+
 /**
  * The audited account's own Reddit profile bio — people put handles, emails
  * and links in their profile description (and its styled user-subreddit) and
@@ -665,14 +676,21 @@ export async function runDeterministicWebSweep(
     );
   }
 
-  /** Search-round: fire queries for a seed, collect candidates mentioning it. */
-  async function runSearchRound(seed: string, queries: string[]): Promise<void> {
-    for (const query of queries) {
-      queriesFired.push(query);
-      let results: Awaited<ReturnType<typeof searchWeb>> = [];
+  /** Search-round: fire every (seed, query) concurrently, then collect
+   * candidates mentioning the seed SERIALLY in input order — candidate order
+   * (and so ranking) is identical to firing the queries one at a time. */
+  async function runSearchRound(jobs: Array<{ seed: string; query: string }>): Promise<void> {
+    const fetched = await mapLimit(jobs, SWEEP_CONCURRENCY, async ({ query }) => {
       try {
-        results = await doSearch(query, { limit: 5 });
+        return { results: await doSearch(query, { limit: 5 }) };
       } catch (err: any) {
+        return { results: [], err };
+      }
+    });
+    for (const [i, { seed, query }] of jobs.entries()) {
+      queriesFired.push(query);
+      const { results, err } = fetched[i];
+      if (err) {
         onProgress?.(`[web-sweep] search failed (${query}): ${err?.message ?? err}`);
         continue;
       }
@@ -707,12 +725,8 @@ export async function runDeterministicWebSweep(
     // these is a stale cross-reference edge in the identity graph.
     const knownHandles = [username, ...roundSeeds];
 
-    const scrapeOne = async (c: CandidateProfile): Promise<void> => {
-      if (c.scraped || scrapedCount >= maxScrapes) return;
-      scrapedCount++;
-      c.scraped = true;
-      const page = await scrapeCandidate(c.url, doScrape, doFollowSite);
-      if (!page) return;
+    /** Fold one scraped page into the shared state (pages, bridges, chase). */
+    const applyPage = (c: CandidateProfile, page: ScrapedPage): void => {
       scrapedPages.push({ source: c.url, text: page.text });
       c.ownerHandle = profileRootHandle(c.url) ?? undefined;
 
@@ -765,19 +779,42 @@ export async function runDeterministicWebSweep(
       }
     };
 
-    for (const c of candidateMap.values()) {
-      if (c.origin === "chase") continue;
-      await scrapeOne(c).catch((err: any) =>
-        onProgress?.(`[web-sweep] scrape failed (${c.url}): ${err?.message ?? err}`),
-      );
-    }
-    // Drain the chase queue within the remaining budget.
-    let idx = 0;
-    while (idx < chaseQueue.length && scrapedCount < maxScrapes) {
-      const c = chaseQueue[idx++];
-      if (c.scraped) continue;
-      await scrapeOne(c).catch(() => undefined);
-    }
+    /** Claim budget for the first pending items (the exact set a serial loop
+     * would scrape — selection never depends on page content), fetch them
+     * concurrently, then apply pages serially in input order. */
+    const scrapeBatch = async (items: CandidateProfile[], onFail?: (c: CandidateProfile, err: any) => void): Promise<void> => {
+      const batch: CandidateProfile[] = [];
+      for (const c of items) {
+        if (c.scraped || scrapedCount >= maxScrapes) continue;
+        scrapedCount++;
+        c.scraped = true;
+        batch.push(c);
+      }
+      const fetched = await mapLimit(batch, SWEEP_CONCURRENCY, async (c) => {
+        try {
+          return { page: await scrapeCandidate(c.url, doScrape, doFollowSite) };
+        } catch (err: any) {
+          return { page: null, err };
+        }
+      });
+      for (const [i, c] of batch.entries()) {
+        try {
+          const { page, err } = fetched[i];
+          if (err) throw err;
+          if (page) applyPage(c, page);
+        } catch (err: any) {
+          onFail?.(c, err);
+        }
+      }
+    };
+
+    await scrapeBatch(
+      [...candidateMap.values()].filter((c) => c.origin !== "chase"),
+      (c, err) => onProgress?.(`[web-sweep] scrape failed (${c.url}): ${err?.message ?? err}`),
+    );
+    // Drain the chase queue within the remaining budget. Chase pages never
+    // enqueue further chases, so the queue is complete at this point.
+    await scrapeBatch([...chaseQueue]);
   }
 
   /** Pages whose scrape failed get consumed silently; chase items also live in
@@ -787,7 +824,7 @@ export async function runDeterministicWebSweep(
   // ── Round 1: the audited username ──
   const round1 = buildQueries(username);
   onProgress?.(`[web-sweep] Round 1: ${round1.length} platform-targeted searches for "${username}"...`);
-  await runSearchRound(username, round1);
+  await runSearchRound(round1.map((query) => ({ seed: username, query })));
   onProgress?.(`[web-sweep] Scraping candidates (budget ${maxScrapes}, ${[...candidateMap.values()].length} found so far)...`);
   let seededHandles = new Set([normalizeHandleKey(username)]);
   await scrapeWithBudget([...seededHandles]);
@@ -894,9 +931,7 @@ export async function runDeterministicWebSweep(
         `[web-sweep] 🔑 Bridge owner handles discovered (CURRENT identity — highest priority): [${bridgeOwnerSeeds.join(", ")}]`,
       );
       const before = new Set(candidateMap.keys());
-      for (const seed of bridgeOwnerSeeds) {
-        await runSearchRound(seed, buildBridgeOwnerQueries(seed));
-      }
+      await runSearchRound(searchJobs(bridgeOwnerSeeds, buildBridgeOwnerQueries));
       const fresh = [...candidateMap.keys()].filter((k) => !before.has(k)).length;
       if (fresh > 0) onProgress?.(`[web-sweep] Bridge-owner search found ${fresh} new candidate(s).`);
     }
@@ -907,18 +942,14 @@ export async function runDeterministicWebSweep(
         `[web-sweep] Round 2 (snowball): ${bridgeOwnerSeeds.length} bridge-owner(s) + ${newHandleSeeds.length} handle seed(s) [${newHandleSeeds.join(", ")}]${emailSeeds.length > 0 ? ` + ${emailSeeds.length} email seed(s)` : ""}${driftSeeds.length > 0 ? ` + ${driftSeeds.length} drift-variant seed(s) [${driftSeeds.join(", ")}]` : ""}...`,
       );
       const before = new Set(candidateMap.keys());
-      for (const seed of newHandleSeeds) {
-        await runSearchRound(seed, buildSeedQueries(seed, "handle"));
-      }
-      for (const email of emailSeeds) {
-        await runSearchRound(email, buildSeedQueries(email, "email"));
-      }
       // Drift-variant queries flow through runSearchRound like any other
       // seed — no extra scrape budget, they only add candidates + mention
       // targets (finalKnown below picks them up via snowballSeeds).
-      for (const seed of driftSeeds) {
-        await runSearchRound(seed, buildSeedQueries(seed, "handle"));
-      }
+      await runSearchRound([
+        ...searchJobs(newHandleSeeds, (s) => buildSeedQueries(s, "handle")),
+        ...searchJobs(emailSeeds, (s) => buildSeedQueries(s, "email")),
+        ...searchJobs(driftSeeds, (s) => buildSeedQueries(s, "handle")),
+      ]);
       const fresh = [...candidateMap.keys()].filter((k) => !before.has(k)).length;
       if (fresh > 0) onProgress?.(`[web-sweep] Snowball found ${fresh} new candidate(s).`);
       for (const s of newHandleSeeds) seededHandles.add(normalizeHandleKey(s));
@@ -938,15 +969,21 @@ export async function runDeterministicWebSweep(
         .map((e) => e.split("@")[1])
         .filter((d) => d && !FREEMAIL_DOMAINS.has(d)),
     )].slice(0, 3);
+    const domainsToFollow: string[] = [];
     for (const domain of customDomains) {
       if (scrapedCount >= maxScrapes) break;
       const norm = `https://${domain}`.replace(/\/$/, "");
       if (candidateMap.has(norm) || candidateMap.has(`${norm}/`)) continue;
       scrapedCount++;
       onProgress?.(`[web-sweep] Chasing custom email domain: ${domain}`);
-      const site = await doFollowSite(`https://${domain}`).catch(() => null);
+      domainsToFollow.push(domain);
+    }
+    const sites = await mapLimit(domainsToFollow, SWEEP_CONCURRENCY, (domain) =>
+      doFollowSite(`https://${domain}`).catch(() => null),
+    );
+    for (const [i, site] of sites.entries()) {
       if (site?.text && site.text.trim().length > 80) {
-        scrapedPages.push({ source: norm, text: site.text });
+        scrapedPages.push({ source: `https://${domainsToFollow[i]}`.replace(/\/$/, ""), text: site.text });
       }
     }
   }

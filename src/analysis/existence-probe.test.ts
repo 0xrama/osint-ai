@@ -117,6 +117,34 @@ describe("runExistenceProbes (scoping & determinism)", () => {
   });
 });
 
+describe("runExistenceProbes (bounded concurrency)", () => {
+  test("random delays give the same result as zero delay, with overlap capped at 4", async () => {
+    const routes = {
+      "https://t.me/h_one": { status: 200, body: "you can contact @h_one" },
+      "https://www.twitch.tv/h_two": { status: 302 },
+      "https://keybase.io/h_two": { status: 200 },
+    };
+    const baseline = await runExistenceProbes(["h_one", "h_two"], { deps: { fetchText: fakeFetch(routes) } });
+    let inFlight = 0;
+    let peak = 0;
+    const slow = fakeFetch(routes);
+    const res = await runExistenceProbes(["h_one", "h_two"], {
+      deps: {
+        fetchText: async (url) => {
+          inFlight++;
+          peak = Math.max(peak, inFlight);
+          await Bun.sleep(Math.random() * 5);
+          inFlight--;
+          return slow(url);
+        },
+      },
+    });
+    expect(res).toEqual(baseline);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(4);
+  });
+});
+
 describe("renderers", () => {
   const deps = {
     fetchText: fakeFetch({

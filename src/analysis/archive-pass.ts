@@ -25,6 +25,8 @@
  * in an old snapshot may have belonged to someone else entirely.
  */
 
+import { mapLimit } from "../runtime/concurrency.ts";
+
 export interface ArchiveSnapshot {
   /** Canonical CDX URL key (e.g. "twitter.com/handle/"). */
   url: string;
@@ -69,6 +71,7 @@ function cdxUrl(pattern: string): string {
 const UA = "osint-ai/2.0 (research; archive pass)";
 const TIMEOUT_MS = 10_000;
 const POLITE_DELAY_MS = 250;
+const CDX_CONCURRENCY = 3;
 const MAX_HANDLES_DEFAULT = 2;
 
 /** Real-network fetchJson: 10s hard timeout, never throws (null on failure —
@@ -150,20 +153,30 @@ export async function runArchivePass(
     `[archive-pass] Querying Wayback CDX for ${archiveHandles.length} handle(s) × ${profilePatterns("x").length} platforms...`,
   );
 
+  // Queries run with small bounded concurrency (the CDX API is touchy);
+  // responses come back in pattern order and are merged serially, so the
+  // snapshot list matches a one-at-a-time run.
+  const patterns = archiveHandles.flatMap(profilePatterns);
+  const responses = await mapLimit(patterns, CDX_CONCURRENCY, async (pattern) => {
+    // Per-query resilience: the CDX API wobbles constantly — a failed
+    // query just means "no data for this URL", never an abort.
+    let json: any = null;
+    try {
+      json = await fetchJson(cdxUrl(pattern));
+    } catch {
+      // swallowed: this pattern contributes nothing
+    }
+    // Politeness only on the real network path — injected fakes (tests)
+    // run instantly. The delay is per worker, between its own queries.
+    if (!injected) await sleep(POLITE_DELAY_MS);
+    return json;
+  });
   const byUrl = new Map<string, ArchiveSnapshot>();
-  for (const handle of archiveHandles) {
-    for (const pattern of profilePatterns(handle)) {
-      // Per-query resilience: the CDX API wobbles constantly — a failed
-      // query just means "no data for this URL", never an abort.
-      try {
-        const json = await fetchJson(cdxUrl(pattern));
-        mergeRows(json, byUrl);
-      } catch {
-        // swallowed: this pattern contributes nothing
-      }
-      // Politeness only on the real network path — injected fakes (tests)
-      // run instantly.
-      if (!injected) await sleep(POLITE_DELAY_MS);
+  for (const json of responses) {
+    try {
+      mergeRows(json, byUrl);
+    } catch {
+      // swallowed: a malformed response contributes nothing
     }
   }
 

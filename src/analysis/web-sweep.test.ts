@@ -474,3 +474,67 @@ describe("web-sweep enrichment: every exported bridge entry carries confidence/r
 		}
 	});
 });
+
+/**
+ * Concurrency must not change output: searches/scrapes run in parallel but are
+ * applied in input order, so a run with random per-call latency (completion
+ * order shuffled) must equal a zero-latency run byte for byte — candidates,
+ * bridges, seeds, queries and the progress log alike.
+ */
+describe("web-sweep concurrency is order-independent", () => {
+	function makeDeps(delay: () => number) {
+		let inFlight = 0;
+		let peak = 0;
+		const timed = async <T>(fn: () => T): Promise<T> => {
+			inFlight++;
+			peak = Math.max(peak, inFlight);
+			try {
+				await new Promise((r) => setTimeout(r, delay()));
+				return fn();
+			} finally {
+				inFlight--;
+			}
+		};
+		const deps: WebSweepDeps = {
+			search: (query) => timed(() => {
+				if (query.includes("site:t.me")) throw new Error("search boom");
+				const seed = (query.match(/"([^"@]+)"/)?.[1] ?? query.split(" ")[0]).toLowerCase();
+				const host = query.match(/site:([a-z.]+)/)?.[1] ?? "x.com";
+				return [
+					{ query, title: `${seed} profile`, url: `https://${host}/${seed}`, description: seed, markdown: undefined },
+					{ query, title: `${seed} again`, url: `https://github.com/${seed}-${query.length % 3}`, description: seed, markdown: undefined },
+				];
+			}),
+			scrape: (url) => timed(() => {
+				if (url.endsWith("-2")) throw new Error("scrape boom");
+				const owner = url.split("/").pop() ?? "";
+				return {
+					url,
+					title: owner,
+					description: "",
+					markdown: owner === "fixtureveil"
+						? "I moved to github.com/fixturenew and x.com/fixturenew. Mail me@fixturenew.dev"
+						: `I am ${owner}; formerly fixtureveil.`,
+					links: [`https://linktr.ee/${owner}`, `https://${owner}.dev`],
+				};
+			}),
+			followSite: (url) => timed(() => ({ url, text: `site ${url} of fixturenew — formerly fixtureveil, ${"x".repeat(80)}` })),
+			redditAbout: async () => null,
+		};
+		return { deps, peak: () => peak };
+	}
+
+	const run = async (delay: () => number) => {
+		const { deps, peak } = makeDeps(delay);
+		const log: string[] = [];
+		const result = await runDeterministicWebSweep("fixtureveil", (m) => log.push(m), { maxScrapes: 24, maxRounds: 2, deps });
+		return { json: JSON.stringify({ result, log }), peak: peak() };
+	};
+
+	test("random latency yields the same result as zero latency, with overlapping requests", async () => {
+		const fast = await run(() => 0);
+		const slow = await run(() => Math.random() * 15);
+		expect(slow.json).toBe(fast.json);
+		expect(slow.peak).toBeGreaterThan(1);
+	});
+});
