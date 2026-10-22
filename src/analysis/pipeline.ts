@@ -138,7 +138,9 @@ export function extractReportBrief(content: string, structured?: StructuredFindi
 }
 
 /** Merge a secondary web sweep (seeded on a Twitter alt lead) into the primary
- *  sweep result, so the single render/corroboration path sees the whole graph. */
+ *  sweep result, so the single render/corroboration path sees the whole graph.
+ *  Bridge owners stay the primary's: the alt sweep's owners mention the alt
+ *  lead, not the subject, and the list seeds probes and the ranker boost. */
 function mergeWebSweep(primary: WebSweepResult, extra: WebSweepResult): WebSweepResult {
 	const emails = new Set(primary.identifiers.emails);
 	for (const e of extra.identifiers.emails) emails.add(e);
@@ -204,7 +206,7 @@ function mergeWebSweep(primary: WebSweepResult, extra: WebSweepResult): WebSweep
 		},
 		bridgeEvidence,
 		snowballSeeds: [...new Set([...(primary.snowballSeeds ?? []), ...(extra.snowballSeeds ?? [])])],
-		bridgeOwnerHandles: [...new Set([...(primary.bridgeOwnerHandles ?? []), ...(extra.bridgeOwnerHandles ?? [])])],
+		bridgeOwnerHandles: primary.bridgeOwnerHandles,
 		redditProfile: primary.redditProfile,
 	};
 }
@@ -550,10 +552,12 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// the CDX archive pass catches pre-rename/defunct profiles (snapshots that
 	// predate the subject's cake day). Both are LEADS — existence ≠ same
 	// person — injected as context and rendered as report blocks. Seeded with
-	// the sweep's top-tier handles (bridge owners first), capped internally.
+	// the sweep's top-tier handles (bridge owners first, then the audited
+	// username itself), capped internally.
 	if (web) {
 		const probeSeeds = [...new Set([
 			...(webSweep?.bridgeOwnerHandles ?? []),
+			username,
 			...rankHandles(
 				webSweep?.identifiers.socialHandles ?? [],
 				username,

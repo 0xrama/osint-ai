@@ -15,6 +15,7 @@ import {
   isVendorEmail,
   mentionsHandle,
   nameLooksReal,
+  statesResidence,
 } from "./match.ts";
 import { scoreItem } from "./rank.ts";
 import type { FilteredItem } from "../types.ts";
@@ -77,6 +78,39 @@ describe("disclosesHandle (disclosure mode)", () => {
       expect(disclosesHandle(text, handle) >= 0).toBe(want);
     });
   }
+});
+
+describe("statesResidence (first-person residence)", () => {
+  test.each([
+    ["I live in San Francisco and the rent is brutal.", true],
+    ["i'm based in pune these days", true],
+    ["We moved to San Francisco last year — I moved to San Francisco too", true],
+    ["I visited San Francisco once", false],
+    ["news from San Francisco", false],
+    ["I live in San Franciscobay", false],
+    ["Can I live in Pune on 30k a month?", false],
+    ["If I moved to Pune, how much would rent cost?", false],
+    ["If I moved to Pune, I would need a new job.", false],
+    ["Suppose I live in Pune with that salary.", false],
+    ["Could I live in Pune on that salary", false],
+    ["I live in Pune? No, I live in Mumbai.", false],
+    ["I live in Pune. Can you recommend a restaurant?", true],
+    ["I live in Pune, can you recommend a restaurant?", true],
+    ["If you need my location, I live in Pune.", true],
+    ["If I moved to Mumbai, rent would rise. I live in Pune now.", true],
+  ])("%p → %p", (text, expected) => {
+    const place = text.toLowerCase().includes("pune") ? "Pune" : "San Francisco";
+    expect(statesResidence(text, place) >= 0).toBe(expected);
+  });
+
+  test("a hypothetical match does not hide a later assertion or change its offset", () => {
+    for (const text of [
+      "Can I live in Pune on 30k? I live in Pune already.",
+      "If I moved to Pune, rent would rise, but I live in Pune already.",
+    ]) {
+      expect(statesResidence(text, "Pune")).toBe(text.lastIndexOf("Pune"));
+    }
+  });
 });
 
 describe("rank known-handle boost uses the token matcher", () => {

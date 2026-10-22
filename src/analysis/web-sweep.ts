@@ -62,7 +62,8 @@ import { mapLimit } from "../runtime/concurrency.ts";
 /** One stale-cross-reference edge: the page at `url` (owned by the bridge
  * owner this entry is keyed under) mentions `target` (the old/known handle).
  * `kind: "anchor-rename"` = the visible link text is the old handle but the
- * link TARGET (`anchorTarget`) is a different profile root. `confidence` and
+ * link TARGET (`anchorTarget`) is a different profile root; those entries are
+ * keyed under `anchorTarget`, whoever owns the page. `confidence` and
  * `reciprocal` are filled by the sweep's final enrichment pass. */
 export interface BridgeEvidenceEntry {
   url: string;
@@ -113,7 +114,8 @@ export interface WebSweepResult {
    * was mentioned (audited username or a discovered seed). `kind:
    * "anchor-rename"` marks the strongest variant: a link whose VISIBLE TEXT is
    * the old handle but whose TARGET (`anchorTarget`) is a different profile
-   * root — the signature of a renamed handle. `confidence` (0..1) and
+   * root — the signature of a renamed handle; keyed under `anchorTarget`,
+   * not the page owner. `confidence` (0..1) and
    * `reciprocal` are attached by the final enrichment pass in
    * runDeterministicWebSweep so every exported entry carries them. */
   bridgeEvidence?: Record<string, BridgeEvidenceEntry[]>;
@@ -259,6 +261,43 @@ function extractAnchorBridges(
   return out;
 }
 
+/**
+ * Fold one page's bridge evidence into `bridgeEvidence`; returns the plain
+ * mention snippets found. Anchor-rename entries are keyed by their link
+ * TARGET, not the page owner: `[old](https://x.com/new)` on a third party's
+ * page makes `new` the renamed identity and says nothing about the owner.
+ * Anchor links are cut before plain-mention detection so the label can't
+ * also make the page owner a bridge.
+ */
+function recordPageBridges(
+  bridgeEvidence: Map<string, BridgeEvidenceEntry[]>,
+  ownerHandle: string | undefined,
+  url: string,
+  text: string,
+  knownHandles: string[],
+): string[] {
+  const add = (key: string, e: BridgeEvidenceEntry) => {
+    const entry = bridgeEvidence.get(key) ?? [];
+    if (!entry.some((x) => x.url === e.url && x.target === e.target && x.kind === e.kind)) entry.push(e);
+    bridgeEvidence.set(key, entry);
+  };
+  const anchors = extractAnchorBridges(text, knownHandles);
+  for (const ab of anchors) {
+    add(ab.anchorTarget.toLowerCase(), { url, snippet: ab.snippet, target: ab.target, kind: "anchor-rename", anchorTarget: ab.anchorTarget });
+  }
+  if (!ownerHandle) return [];
+  const plain = anchors.reduce((t, ab) => t.split(ab.snippet).join(" "), text);
+  const found: string[] = [];
+  for (const h of knownHandles) {
+    if (normalizeHandleKey(ownerHandle) === normalizeHandleKey(h)) continue;
+    const mentions = extractMentions(plain, h);
+    if (mentions.length === 0) continue;
+    found.push(...mentions);
+    add(ownerHandle.toLowerCase(), { url, snippet: mentions[0], target: h });
+  }
+  return found;
+}
+
 /** Link aggregators: pages built purely to enumerate someone's identities.
  * Chased unconditionally — they never mention the audited handle by name. */
 const LINK_AGGREGATOR_RE =
@@ -316,30 +355,23 @@ export function scoreBridgeEntry(
 
 /**
  * Reciprocity: which bridge edges have a matching reverse edge. An edge
- * owner→target is reciprocal when some entry (from ANY owner) asserts a
- * mention between the same two handles in the opposite direction — for
- * anchor-rename entries the pair is (target ↔ anchorTarget), and the rename
- * direction itself counts as the reverse assertion (the label literally
- * points back at the new profile). Returns keys `${ownerLc}->${targetLc}`
- * (owner lowercased as keyed in the map, target lowercased). Pure; drift/
- * separator-tolerant via normalizeHandleKey.
+ * owner→target is reciprocal when some entry asserts target→owner. Anchor-
+ * rename entries are keyed by their link target, so they are ordinary
+ * new→old edges here and need an independent reverse (the old handle's page
+ * mentioning the new one) — an anchor never counts as its own reverse.
+ * Returns keys `${ownerLc}->${targetLc}` (owner lowercased as keyed in the
+ * map, target lowercased). Pure; drift/separator-tolerant via
+ * normalizeHandleKey.
  */
 export function computeReciprocal(
   bridgeEvidence: Record<string, BridgeEvidenceEntry[]>,
 ): Set<string> {
-  // Directed normalized edge set: every entry contributes owner→target, and
-  // anchor-rename entries additionally contribute target→anchorTarget (the
-  // rename direction: the OLD label points AT the NEW profile).
   const edges = new Set<string>();
   for (const [owner, entries = []] of Object.entries(bridgeEvidence)) {
     const o = normalizeHandleKey(owner);
     for (const e of entries) {
       const t = normalizeHandleKey(e.target ?? "");
       if (o && t && o !== t) edges.add(`${o}->${t}`);
-      if (e.kind === "anchor-rename" && e.anchorTarget) {
-        const a = normalizeHandleKey(e.anchorTarget);
-        if (t && a && t !== a) edges.add(`${t}->${a}`);
-      }
     }
   }
   const out = new Set<string>();
@@ -347,12 +379,7 @@ export function computeReciprocal(
     const o = normalizeHandleKey(owner);
     for (const e of entries) {
       const t = normalizeHandleKey(e.target ?? "");
-      if (!o || !t || o === t) continue;
-      // Anchor-rename: the pair is (target ↔ anchorTarget) — and the rename
-      // direction itself asserts the reverse (the old label points AT the new
-      // profile), so these are reciprocal whenever t→anchorTarget exists.
-      const a = e.kind === "anchor-rename" && e.anchorTarget ? normalizeHandleKey(e.anchorTarget) : "";
-      if ((a && edges.has(`${t}->${a}`)) || edges.has(`${t}->${o}`)) {
+      if (o && t && o !== t && edges.has(`${t}->${o}`)) {
         out.add(`${owner}->${(e.target ?? "").toLowerCase()}`);
       }
     }
@@ -679,32 +706,9 @@ export async function runDeterministicWebSweep(
       c.ownerHandle = profileRootHandle(c.url) ?? undefined;
 
       // Bridge edges against ALL known handles (not just the audited one).
-      const ownerLc = c.ownerHandle?.toLowerCase();
-      for (const h of knownHandles) {
-        if (ownerLc && normalizeHandleKey(c.ownerHandle!) === normalizeHandleKey(h)) continue;
-        const mentions = extractMentions(page.text, h);
-        if (mentions.length > 0 && c.ownerHandle) {
-          c.usernameMentions = [...(c.usernameMentions ?? []), ...mentions].slice(0, 4);
-          const key = c.ownerHandle.toLowerCase();
-          const entry = bridgeEvidence.get(key) ?? [];
-          if (!entry.some((e) => e.url === c.url && e.target === h)) {
-            entry.push({ url: c.url, snippet: mentions[0], target: h });
-          }
-          bridgeEvidence.set(key, entry);
-        }
-      }
-
-      // Anchor-rename bridges: [old](new) links. Direction is unambiguous —
-      // the labeled handle is the stale one, the target is the current one.
-      if (c.ownerHandle) {
-        for (const ab of extractAnchorBridges(page.text, knownHandles)) {
-          const key = c.ownerHandle.toLowerCase();
-          const entry = bridgeEvidence.get(key) ?? [];
-          if (!entry.some((e) => e.url === c.url && e.target === ab.target && e.kind === "anchor-rename")) {
-            entry.push({ url: c.url, snippet: ab.snippet, target: ab.target, kind: "anchor-rename", anchorTarget: ab.anchorTarget });
-          }
-          bridgeEvidence.set(key, entry);
-        }
+      const mentions = recordPageBridges(bridgeEvidence, c.ownerHandle, c.url, page.text, knownHandles);
+      if (mentions.length > 0) {
+        c.usernameMentions = [...(c.usernameMentions ?? []), ...mentions].slice(0, 4);
       }
 
       // Link chase (primaries only — no recursive crawling). Aggregator pages
@@ -814,34 +818,22 @@ export async function runDeterministicWebSweep(
       seededHandles.add(ownerNorm);
     }
     // Also collect bridge owners from the bridgeEvidence map (pages whose
-    // owner mentioned a known handle but might not have usernameMentions set).
+    // owner mentioned a known handle but might not have usernameMentions set,
+    // and anchor-rename targets, which own no scraped page).
     for (const [owner] of bridgeEvidence) {
+      const ownerNorm = normalizeHandleKey(owner);
       if (
-        owner === normalizeHandleKey(username) ||
+        ownerNorm === normalizeHandleKey(username) ||
         isSeededHandleWord(owner) ||
-        seededHandles.has(owner)
+        seededHandles.has(ownerNorm)
       ) continue;
       // Find the original-cased handle from the candidates.
       const matchC = [...candidateMap.values()].find(
-        (c) => c.ownerHandle && normalizeHandleKey(c.ownerHandle) === owner,
+        (c) => c.ownerHandle && normalizeHandleKey(c.ownerHandle) === ownerNorm,
       );
       const displayHandle = matchC?.ownerHandle ?? owner;
       bridgeOwnerSeeds.push(displayHandle);
-      seededHandles.add(owner);
-    }
-    // Anchor-rename TARGETS are the current identity even when the page is a
-    // third party's: [fixtureveil](https://x.com/fixturenew) means fixturenew is the
-    // renamed handle regardless of who owns the page containing the link.
-    for (const entries of bridgeEvidence.values()) {
-      for (const e of entries) {
-        const t = e.anchorTarget;
-        if (!t || isSeededHandleWord(t)) continue;
-        const tNorm = normalizeHandleKey(t);
-        if (tNorm === normalizeHandleKey(username) || seededHandles.has(tNorm)) continue;
-        if (bridgeOwnerSeeds.some((s) => normalizeHandleKey(s) === tNorm)) continue;
-        bridgeOwnerSeeds.push(t);
-        seededHandles.add(tNorm);
-      }
+      seededHandles.add(ownerNorm);
     }
 
     // ── DRIFT-VARIANT SEARCH SEEDS: people re-spell their own handle with
@@ -939,34 +931,19 @@ export async function runDeterministicWebSweep(
   // ── Final bridge pass over ALL scraped pages with the COMPLETE known-handle
   // set. Detection at scrape time only knows the seeds discovered so far, so a
   // page scraped in round 1 that links to a handle surfaced in round 2 would
-  // be missed. One extra regex sweep is trivial and closes the gap.
-  const finalKnown = [username, ...snowballSeeds.filter((s) => !s.includes("@"))].filter((s) => !isSeededHandleWord(s));
+  // be missed. One extra regex sweep is trivial and closes the gap. Bridge
+  // owners join the set even when no round 2 seeded them, so the subject's
+  // own page mentioning an owner is found and the pair reads as reciprocal.
+  const finalKnown = [...new Set([username, ...snowballSeeds.filter((s) => !s.includes("@")), ...bridgeEvidence.keys()])]
+    .filter((s) => !isSeededHandleWord(s));
   const textByUrl = new Map<string, string>();
   for (const p of scrapedPages) textByUrl.set(p.source.replace(/\/$/, ""), p.text);
   for (const c of [...candidateMap.values(), ...chaseQueue]) {
-    if (!c.scraped || !c.ownerHandle) continue;
+    if (!c.scraped) continue;
     const text = textByUrl.get(c.url.replace(/\/$/, ""));
     if (!text) continue;
-    for (const h of finalKnown) {
-      if (normalizeHandleKey(c.ownerHandle) === normalizeHandleKey(h)) continue;
-      const mentions = extractMentions(text, h);
-      if (mentions.length === 0) continue;
-      c.usernameMentions = [...(c.usernameMentions ?? []), ...mentions].slice(0, 4);
-      const key = c.ownerHandle.toLowerCase();
-      const entry = bridgeEvidence.get(key) ?? [];
-      if (!entry.some((e) => e.url === c.url && e.target === h)) {
-        entry.push({ url: c.url, snippet: mentions[0], target: h });
-      }
-      bridgeEvidence.set(key, entry);
-    }
-    for (const ab of extractAnchorBridges(text, finalKnown)) {
-      const key = c.ownerHandle.toLowerCase();
-      const entry = bridgeEvidence.get(key) ?? [];
-      if (!entry.some((e) => e.url === c.url && e.target === ab.target && e.kind === "anchor-rename")) {
-        entry.push({ url: c.url, snippet: ab.snippet, target: ab.target, kind: "anchor-rename", anchorTarget: ab.anchorTarget });
-      }
-      bridgeEvidence.set(key, entry);
-    }
+    const mentions = recordPageBridges(bridgeEvidence, c.ownerHandle, c.url, text, finalKnown);
+    if (mentions.length > 0) c.usernameMentions = [...(c.usernameMentions ?? []), ...mentions].slice(0, 4);
   }
 
   // ── Bridge enrichment: confidence + reciprocity over the FINAL map ──

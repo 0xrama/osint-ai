@@ -98,8 +98,9 @@ describe("identity graph: subject fusion", () => {
     const graph = buildIdentityGraph({
       username: "fixtureveil",
       webSweep: makeSweep({
+        // The sweep keys anchor entries by their link target, not the page owner.
         bridgeEvidence: {
-          dirpage: [
+          fixturenew: [
             {
               url: "https://dirpage.example/",
               snippet: "[fixtureveil](https://x.com/fixturenew)",
@@ -319,6 +320,86 @@ describe("identity graph: email local-part join", () => {
     expect(join).toBeDefined();
     expect(join!.kind).toBe("email-of");
     expect(join!.strength).toBe(0.6);
+  });
+});
+
+describe("identity graph: own-domain email join", () => {
+  const sweepWith = (emailSource: string) => makeSweep({
+    identifiers: { emails: ["hello@quietsite.dev"], socialHandles: [] },
+    identifierSources: { emails: { "hello@quietsite.dev": [emailSource] }, handles: {}, freemail: {} },
+  });
+  const gitHub = makeGitHub({
+    identities: [{
+      login: "fixturenew", url: "https://github.com/fixturenew", blog: "https://quietsite.dev",
+      commitAuthors: [], commitStats: { scanned: 0, attributed: 0, excluded: 0 },
+    }],
+  });
+
+  test("an address published on its own domain joins the handle whose profile links the site", () => {
+    const graph = buildIdentityGraph({ username: "fixtureveil", webSweep: sweepWith("https://quietsite.dev/contact"), gitHub });
+    expect(edgeBetween(graph, "handle:fixturenew", "email:hello@quietsite.dev")?.kind).toBe("email-of");
+  });
+
+  test.each([
+    "https://quietsite.dev/about",
+    "https://www.quietsite.dev/about/",
+    "quietsite.dev/about",
+    "www.quietsite.dev/about/",
+  ])("a profile site path still owns the domain's email: %s", (blog) => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: sweepWith("https://www.quietsite.dev/contact"),
+      gitHub: makeGitHub({ identities: [{ ...gitHub.identities[0], blog }] }),
+    });
+    expect(edgeBetween(graph, "handle:fixturenew", "email:hello@quietsite.dev")?.kind).toBe("email-of");
+    expect(graph.persons.find((p) => p.handleNodes.includes("handle:fixturenew"))?.emailNodes)
+      .toContain("email:hello@quietsite.dev");
+    expect(graph.nodes.find((n) => n.kind === "site")?.id).toBe("site:quietsite.dev/about");
+  });
+
+  test("own-domain email ownership cannot undo a profile namesake split", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      corpusTexts: [{ text: "I live in Manchester these days" }],
+      webSweep: makeSweep({
+        identifiers: { emails: ["hello@fixtureveil.dev"], socialHandles: [] },
+        identifierSources: { emails: { "hello@fixtureveil.dev": ["https://fixtureveil.dev/contact"] }, handles: {}, freemail: {} },
+      }),
+      gitHub: makeGitHub({ identities: [{
+        login: "fixtureveil", url: "https://github.com/fixtureveil", location: "Tokyo, Japan",
+        name: "John Doe", blog: "https://fixtureveil.dev",
+        commitAuthors: [], commitStats: { scanned: 0, attributed: 0, excluded: 0 },
+      }] }),
+    });
+    const subject = graph.persons.find((p) => p.isSubject)!;
+    expect(subject.handleNodes).toEqual(["handle:fixtureveil"]);
+    expect(subject.emailNodes).toEqual([]);
+    expect(subject.nameNodes).toEqual([]);
+    const namesake = graph.persons.find((p) => p.handleNodes.includes("handle:fixtureveil@github"))!;
+    expect(namesake.isSubject).toBe(false);
+    expect(namesake.emailNodes).toContain("email:hello@fixtureveil.dev");
+    expect(namesake.nameNodes).toContain("name:john doe");
+  });
+
+  test("without a known site owner the domain-spelling fallback still joins", () => {
+    const graph = buildIdentityGraph({ username: "quietsite", webSweep: sweepWith("https://quietsite.dev/contact") });
+    expect(graph.persons.find((p) => p.isSubject)?.emailNodes).toContain("email:hello@quietsite.dev");
+  });
+
+  test.each(["notquietsite.dev", "quietsite.dev.evil.test", "sub.quietsite.dev"])(
+    "a different profile host does not own the email: %s", (host) => {
+      const graph = buildIdentityGraph({
+        username: "fixtureveil",
+        webSweep: sweepWith("https://quietsite.dev/contact"),
+        gitHub: makeGitHub({ identities: [{ ...gitHub.identities[0], blog: `https://${host}/about` }] }),
+      });
+      expect(edgeBetween(graph, "handle:fixturenew", "email:hello@quietsite.dev")).toBeUndefined();
+    },
+  );
+
+  test("the same address seen only on another site does not join", () => {
+    const graph = buildIdentityGraph({ username: "fixtureveil", webSweep: sweepWith("https://forum.example/thread"), gitHub });
+    expect(edgeBetween(graph, "handle:fixturenew", "email:hello@quietsite.dev")).toBeUndefined();
   });
 });
 

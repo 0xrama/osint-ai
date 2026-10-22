@@ -237,7 +237,9 @@ interface HandleBucket {
  *     A corpus-extracted email (non-vendor, non-noreply) gets the same
  *     edge, evidence = the permalinks of the posts containing it.
  *   - `email-of` (0.9 GitHub profile/commit email; 0.6 email local-part
- *     heuristic): email belongs to the handle's owner.
+ *     heuristic or own-domain address — published on its own domain, owned
+ *     by the site-of handle or the handle the domain spells): email belongs
+ *     to the handle's owner.
  *   - `name-of` (0.8): real-name leak on a GitHub/Twitter profile.
  *   - `site-of` (0.7): profile blog/website link. Never merges persons.
  */
@@ -434,20 +436,16 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
       for (const e of entries) {
         const target = handleNodes.get(normalizeHandleKey(e.target ?? input.username));
         if (!target) continue;
+        // Anchor entries are keyed by the link target (label = old, target =
+        // new), so the owner here is the renamed handle, not the page owner.
         if (e.kind === "anchor-rename") {
-          // label = old, link target = new: the edge joins those two, whoever
-          // owns the page (it may be a third party linking the subject).
-          const renamed = handleNodes.get(normalizeHandleKey(e.anchorTarget ?? ownerRaw)) ?? owner;
-          addEdge(renamed.id, target.id, "anchor-rename", STRENGTH.anchorRename, [e.url]);
+          addEdge(owner.id, target.id, "anchor-rename", STRENGTH.anchorRename, [e.url]);
           continue;
         }
-        // The anchor's label is also a plain mention of the target on the same
-        // page; that one observation already produced the anchor edge.
-        const anchored = entries.some((a) => a.kind === "anchor-rename" && a.url === e.url && a.target === e.target);
         // Strength = the sweep's per-bridge confidence: a one-way third-party
         // mention (0.5) stays below the merge line; an own-profile (0.8),
         // aggregator (0.9) or reciprocal bridge merges.
-        if (!anchored) addEdge(owner.id, target.id, "rename", e.confidence ?? STRENGTH.rename, [e.url]);
+        addEdge(owner.id, target.id, "rename", e.confidence ?? STRENGTH.rename, [e.url]);
       }
     }
   }
@@ -582,6 +580,29 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
         ...(emailProvenance.get(lc) ?? []).slice(0, 1),
       ]);
     }
+  }
+
+  // 5g. Own-domain emails: an address a site publishes on its own domain
+  // (hello@jane.dev on jane.dev) belongs to the site's owner — a handle whose
+  // profile links the site, or the handle the domain spells out.
+  const hostOf = (url: string) => siteKey(url)?.split("/")[0] ?? "";
+  for (const [lc] of emailNodes) {
+    const domain = lc.split("@")[1] ?? "";
+    const onSite = (emailProvenance.get(lc) ?? []).filter((u) => hostOf(u) === domain);
+    if (onSite.length === 0) continue;
+    const matchingSites = new Set(
+      [...siteNodes].filter(([key]) => key.split("/")[0] === domain).map(([, node]) => node.id),
+    );
+    const owners = new Set(
+      [...edgeMap.values()].filter((e) => e.kind === "site-of" && matchingSites.has(e.to)).map((e) => e.from),
+    );
+    // Explicit site ownership outranks string similarity, especially a split namesake.
+    if (owners.size === 0) {
+      const spelledKey = normalizeHandleKey(domain.split(".")[0] ?? "");
+      const spelled = spelledKey.length >= 4 ? handleNodes.get(spelledKey) : undefined;
+      if (spelled && !(spelled.id === auditedId && splitEmails.has(lc))) owners.add(spelled.id);
+    }
+    for (const id of owners) addEdge(id, `email:${lc}`, "email-of", STRENGTH.emailLocalPart, onSite.slice(0, 1));
   }
 
   /* ── 6. Assemble: deterministic ordering everywhere ──────────────────── */

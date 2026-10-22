@@ -43,7 +43,7 @@ import { normalizeHandleKey, type DirectIdentifiers } from "./extract.ts";
 import { profileRootHandle, rankHandles, type WebSweepResult } from "./web-sweep.ts";
 import type { GitHubPassResult, GitHubIdentity } from "./github-pass.ts";
 import { isReclaimedHandle, type TwitterPassResult } from "./twitter-pass.ts";
-import { disclosesHandle, isContentlessEmail, mentionsHandle, nameLooksReal, snippetAround } from "./match.ts";
+import { disclosesHandle, isContentlessEmail, mentionsHandle, nameLooksReal, snippetAround, statesResidence } from "./match.ts";
 import type { AccountStatus, StructuredFindings, Finding, FindingCategory } from "./findings.ts";
 import { canonicalSourceUrl, buildVerdict, emptyVerdict, type AuditVerdict } from "./evidence.ts";
 import type { IdentityGraph, PersonEntity } from "./identity-graph.ts";
@@ -1084,6 +1084,24 @@ function computeInner(
     addToCluster(matched, c.domain, c.sourceId, c.evidence);
   }
 
+  /* ── Reddit-side residence statements corroborate subject locations ── */
+  // "I live in San Francisco" in the subject's own post confirms a GitHub
+  // "San Francisco, CA" even when the LLM emitted no finding for it. Each
+  // stating text is one reddit-domain source; the first-person cue
+  // (match.ts statesResidence) keeps "I visited Paris" from counting.
+  for (const acc of clusters.values()) {
+    if (acc.signalType !== "location" || (graph ? !acc.person?.isSubject : acc.person)) continue;
+    const places = [...new Set([...acc.rawValues].flatMap((v) => [v, v.split(",")[0]]).map((v) => v.trim()))];
+    corpusTexts.forEach((ct, i) => {
+      const text = String(ct?.text ?? "");
+      let idx = -1;
+      const hit = places.find((p) => (idx = statesResidence(text, p)) >= 0);
+      if (!hit) return;
+      const permalink = normPermalink(String(ct?.permalink ?? ""));
+      addToCluster(acc, "reddit", `corpus:${permalink || i}`, permalink || snippetAround(text, idx, hit.length));
+    });
+  }
+
   // Attach GitHub account-created year to age clusters for contradiction math.
   for (const id of ghIdentities) {
     const login = String(id?.login ?? "").toLowerCase();
@@ -1176,6 +1194,9 @@ function computeInner(
 
   /* ── Contradiction detection ── */
   const contradictions: string[] = [];
+  // With a graph, only clusters it attributes to the subject speak for the
+  // subject; an unowned web page's location must not move the verdict.
+  const forSubject = (c: CorroborationCluster) => (graph ? c.isSubject === true : c.isSubject !== false);
 
   // Intra-type: location / employer / real_name (clusters that didn't merge).
   const byType = (t: SignalType) => finalClusters.filter((c) => c.signalType === t);
@@ -1188,7 +1209,7 @@ function computeInner(
         const b = locationClusters[j];
         if (a.personId !== b.personId) continue;
         if (a.independentSources >= 1 && b.independentSources >= 1) {
-          if (a.isSubject !== false) pairs.push(`${a.value} vs ${b.value}`);
+          if (forSubject(a)) pairs.push(`${a.value} vs ${b.value}`);
           a.contradictions = [...(a.contradictions ?? []), b.value];
           b.contradictions = [...(b.contradictions ?? []), a.value];
         }
@@ -1207,7 +1228,7 @@ function computeInner(
         const b = employerClusters[j];
         if (a.personId !== b.personId) continue;
         if (a.independentSources >= 2 && b.independentSources >= 2) {
-          if (a.isSubject !== false) pairs.push(`${a.value} vs ${b.value}`);
+          if (forSubject(a)) pairs.push(`${a.value} vs ${b.value}`);
           a.contradictions = [...(a.contradictions ?? []), b.value];
           b.contradictions = [...(b.contradictions ?? []), a.value];
         }
@@ -1229,7 +1250,7 @@ function computeInner(
         const bTok = nameTokens(b.value);
         const shared = aTok.some((t) => bTok.includes(t));
         if (!shared && a.independentSources >= 1 && b.independentSources >= 1) {
-          if (a.isSubject !== false) pairs.push(`${a.value} vs ${b.value}`);
+          if (forSubject(a)) pairs.push(`${a.value} vs ${b.value}`);
           a.contradictions = [...(a.contradictions ?? []), b.value];
           b.contradictions = [...(b.contradictions ?? []), a.value];
         }
@@ -1254,7 +1275,7 @@ function computeInner(
       if (createdYear <= 0) continue;
       const openAge = age - (currentYear - createdYear);
       if (openAge < 8 || age < 10 || age > 100) {
-        if (ageCl.isSubject !== false) contradictions.push(
+        if (forSubject(ageCl)) contradictions.push(
           `Age estimate (${age}) inconsistent with GitHub account created ${createdYear}`,
         );
         ageCl.contradictions = [...(ageCl.contradictions ?? []), `GitHub account created ${createdYear}`];
@@ -1266,7 +1287,7 @@ function computeInner(
   const uniqueContradictions = [...new Set(contradictions)].sort();
 
   /* ── Score (0–100 advisory exposure gauge) ── */
-  const subjectClusters = finalClusters.filter((c) => c.isSubject !== false && c.independentSources > 0);
+  const subjectClusters = finalClusters.filter((c) => forSubject(c) && c.independentSources > 0);
   let score = 0;
   for (const c of subjectClusters) {
     const baseWeight =
@@ -1292,7 +1313,7 @@ function computeInner(
     c.isSubject === true && strongIdentityType(c.signalType) && c.accountStatus !== "POSSIBLE") : [];
   const floor: Confidence = exposed.some((c) => c.signalType === "real_name") && exposed.some((c) => c.signalType === "email") ? "high" :
     exposed.length > 0 ? "medium" : "low";
-  const overallRisk = mapOverallRisk(finalClusters, uniqueContradictions, floor);
+  const overallRisk = mapOverallRisk(finalClusters.filter(forSubject), uniqueContradictions, floor);
 
   const verdict = buildVerdict({
     overallRisk,

@@ -133,11 +133,9 @@ describe("eval suite: full regression sweep", () => {
     expect(Object.keys(ag.categoryCoverage).length).toBeGreaterThanOrEqual(9);
   });
 
-  // anchor-rename-1 misses: web-sweep reports the third-party page owner as
-  // the bridge owner instead of the anchor target (ROADMAP).
-  test("aggregate bridge F1 >= 0.92", async () => {
+  test("aggregate bridge F1 is perfect", async () => {
     const ag = await runEvalSuite(FIXTURES);
-    expect(ag.meanBridgeF1).toBeGreaterThanOrEqual(0.92);
+    expect(ag.meanBridgeF1).toBe(1);
   });
 
   test("aggregate identifier F1 >= 0.77", async () => {
@@ -151,15 +149,12 @@ describe("eval suite: full regression sweep", () => {
   });
 
   // Ratchet floors: raise them when a fix lifts the number, never lower them.
-  // calibrateConfidence's constants are already grid-fitted. Known misses:
-  // collaborator-commit-1 risk (corpus location isn't a finding in the eval),
-  // own-domain-mailbox-1 fusion (site emails don't link to the site owner) —
-  // see ROADMAP.
+  // calibrateConfidence's constants are already grid-fitted.
   test("fusion and risk calibration floors", async () => {
     const ag = await runEvalSuite(FIXTURES);
-    expect(ag.meanFusionRecall).toBeGreaterThanOrEqual(0.92);
+    expect(ag.meanFusionRecall).toBe(1);
     expect(ag.fusionFalseLinkCount).toBe(0);
-    expect(ag.riskAccuracy).toBeGreaterThanOrEqual(13 / 14);
+    expect(ag.riskAccuracy).toBe(1);
     // A handle containing the audited name as a hyphen token (john-dev ⊃ john)
     // is not a bridge and must not fuse into the subject.
     expect(ag.perFixture.find((m) => m.fixtureId === "common-username-1")!.fusionFalseLinks).toEqual([]);

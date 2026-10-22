@@ -280,6 +280,32 @@ export function disclosesHandle(text: string, handle: string): number {
   return -1;
 }
 
+/** First-person residence cues: a place named right after one is where the
+ *  writer lives (or lived), not a city they visited or read about. */
+const RESIDENCE_CUE = String.raw`(?:i\s+(?:live|lived|reside|grew\s+up)\s+in|i\s+(?:moved|relocated)\s+to|(?:i'?m|i\s+am)\s+(?:based|living|located)\s+(?:in|out\s+of)|(?:i'?m|i\s+am)\s+from)`;
+
+/**
+ * Offset of `place` where the subject's own text states residence in it
+ * ("I live in San Francisco", "I'm based in Pune"), or -1. Corroborates a
+ * location without an LLM finding; the first-person cue keeps "I visited
+ * Paris" or "news from Delhi" from counting. Questions and hypothetical
+ * clauses are not assertions, even when they contain the same cue.
+ */
+export function statesResidence(text: string, place: string): number {
+  const p = place.trim();
+  if (p.length < 3) return -1;
+  const re = new RegExp(String.raw`\b${RESIDENCE_CUE}\s+(?:the\s+)?(${escapeRegExp(p)})(?![\w-])`, "gi");
+  for (const m of text.matchAll(re)) {
+    const before = text.slice(0, m.index).split(/[,.!?;\n]|\b(?:but|however)\b/i).at(-1) ?? "";
+    const after = text.slice(m.index + m[0].length);
+    if (/\b(?:if|unless|suppose|supposing|imagine|wish|whether)\b/i.test(before)) continue;
+    if (/\b(?:can|could|should|would|may|might|must|do|did)\s*$/i.test(before)) continue;
+    if (/^[^,.!?;\n]*\?/.test(after)) continue;
+    return m.index + m[0].length - m[1].length;
+  }
+  return -1;
+}
+
 /** Whitespace-collapsed excerpt around [idx, idx+len), ellipsized where cut
  *  and capped at 160 chars — the evidence snippet for a mention. */
 export function snippetAround(text: string, idx: number, len: number, radius = 60): string {

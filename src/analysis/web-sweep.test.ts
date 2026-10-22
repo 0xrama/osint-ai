@@ -116,6 +116,23 @@ describe("web-sweep anchor-rename bridges", () => {
 		expect(result.bridgeOwnerHandles).toContain("fixturenew");
 	});
 
+	test("[old](new) on a THIRD party's page makes the target the bridge owner, not the page owner", async () => {
+		const search: WebSweepDeps["search"] = async (query) => [
+			{ query, title: "marta-k", url: "https://github.com/marta-k", description: "talks I liked: fixtureveil", markdown: undefined },
+		];
+		const scrape: WebSweepDeps["scrape"] = async (url) => ({
+			url, title: "marta-k", description: "", links: [],
+			markdown: "Talks I liked:\n- [fixtureveil](https://x.com/fixturenew) — fuzzing parsers",
+		});
+		const result = await runDeterministicWebSweep("fixtureveil", () => {}, {
+			maxScrapes: 6, maxRounds: 1, deps: { search, scrape, redditAbout: async () => null },
+		});
+		expect(result.bridgeOwnerHandles).toEqual(["fixturenew"]);
+		const [anchor] = result.bridgeEvidence?.["fixturenew"] ?? [];
+		expect(anchor?.kind).toBe("anchor-rename");
+		expect(anchor?.reciprocal).toBe(false); // nothing points back
+	});
+
 	test("label == target self-link is NOT an anchor-rename bridge", async () => {
 		const scrape: WebSweepDeps["scrape"] = async (url) => ({
 			url,
@@ -354,6 +371,23 @@ describe("web-sweep bridge confidence scoring (scoreBridgeEntry)", () => {
 });
 
 describe("web-sweep reciprocity detection (computeReciprocal)", () => {
+	test("a single-round sweep still finds the subject's page mentioning a bridge owner", async () => {
+		// No round 2 ever seeds fixturenew, so only the final pass can see the
+		// audited handle's own page pointing back at it.
+		const pages: Record<string, string> = {
+			"https://github.com/fixturenew": "formerly fixtureveil",
+			"https://github.com/fixtureveil": "moved to fixturenew",
+		};
+		const search: WebSweepDeps["search"] = async (query) => Object.keys(pages).map((url) => (
+			{ query, title: "fixtureveil", url, description: "fixtureveil", markdown: undefined }
+		));
+		const scrape: WebSweepDeps["scrape"] = async (url) => ({ url, title: "", description: "", links: [], markdown: pages[url] ?? "" });
+		const result = await runDeterministicWebSweep("fixtureveil", () => {}, {
+			maxScrapes: 6, maxRounds: 1, deps: { search, scrape, redditAbout: async () => null },
+		});
+		expect(result.bridgeEvidence?.["fixturenew"]?.[0]?.reciprocal).toBe(true);
+	});
+
 	test("a plain two-way mention pair is detected in both directions", () => {
 		const rec = computeReciprocal({
 			handlea: [{ url: "https://github.com/handlea", snippet: "…", target: "handleb" }],
@@ -363,11 +397,14 @@ describe("web-sweep reciprocity detection (computeReciprocal)", () => {
 		expect(rec.has("handleb->handlea")).toBe(true);
 	});
 
-	test("anchor-rename form: the rename pair (target ↔ anchorTarget) counts as the reverse edge", () => {
-		// Owner's page carries [old](new) — the label literally points back at
-		// the new profile, so the pair is reciprocal by construction.
+	test("an anchor-rename is not its own reverse edge", () => {
+		// [old](new) keyed under the new handle is one new→old assertion; it
+		// becomes reciprocal only when the old handle's page mentions the new one.
+		const anchor = { url: "https://github.com/marta-k", snippet: "…", target: "fixtureveil", kind: "anchor-rename" as const, anchorTarget: "fixturenew" };
+		expect(computeReciprocal({ fixturenew: [anchor] }).size).toBe(0);
 		const rec = computeReciprocal({
-			fixturenew: [{ url: "https://github.com/fixturenew", snippet: "…", target: "fixtureveil", kind: "anchor-rename", anchorTarget: "fixturenew" }],
+			fixturenew: [anchor],
+			fixtureveil: [{ url: "https://github.com/fixtureveil", snippet: "…", target: "fixturenew" }],
 		});
 		expect(rec.has("fixturenew->fixtureveil")).toBe(true);
 	});

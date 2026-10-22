@@ -1143,6 +1143,40 @@ describe("identity-graph exposure floor", () => {
     expect(scored({ username: "target_user", webSweep: sweep(true), gitHub: profile({ name: "Alice Chen" }) }).overallRisk).toBe("high");
   });
 
+  test("with a graph, a cluster no person owns does not speak for the subject", () => {
+    const input = { username: "target_user", webSweep: sweep(false) };
+    const unowned = scored(input);
+    expect(unowned.clusters.map((c) => c.isSubject)).toEqual([undefined]);
+    expect(unowned.score).toBe(0);
+    expect(run(input).score).toBeGreaterThan(0); // no graph: unowned clusters still count
+  });
+
+  test("a residence statement in the subject's posts corroborates the profile location", () => {
+    const corpusTexts = [
+      { text: "I live in Pune, rent is fine", permalink: "https://reddit.com/r/pune/comments/a1/x/" },
+      { text: "I visited Pune once", permalink: "https://reddit.com/r/travel/comments/a2/x/" },
+    ];
+    const result = scored({ username: "target_user", webSweep: sweep(true), gitHub: profile(), corpusTexts });
+    const pune = result.clusters.find((c) => c.signalType === "location")!;
+    expect(pune.sourceBreakdown.reddit_evidence).toBe(1);
+    expect(pune.independentSources).toBe(2);
+  });
+
+  test.each([
+    "Can I live in Pune on 30k a month?",
+    "If I moved to Pune, how much would rent cost?",
+    "If I moved to Pune, I would need a new job.",
+  ])("a hypothetical residence adds no evidence: %s", (text) => {
+    const result = scored({
+      username: "target_user", webSweep: sweep(true), gitHub: profile(),
+      corpusTexts: [{ text, permalink: "https://reddit.com/r/pune/comments/a1/x/" }],
+    });
+    const pune = result.clusters.find((c) => c.signalType === "location")!;
+    expect(pune.sourceBreakdown.reddit_evidence).toBe(0);
+    expect(pune.independentSources).toBe(1);
+    expect(pune.confidence).toBe("low");
+  });
+
   test("contradictions still downgrade the floored risk one step", () => {
     const result = scored({
       username: "target_user", webSweep: sweep(true), gitHub: profile(),

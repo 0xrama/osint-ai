@@ -64,8 +64,10 @@ highest-value catch.
 - **Anchor-rename bridge** — a link whose visible text is the old handle but
   whose target is a different profile root (`[old](https://x.com/new)`).
   Direction is unambiguous (label = old, target = new): entries carry
-  `kind: "anchor-rename"` + `anchorTarget`, and the target joins the
-  bridge-owner seeds even when the page belongs to a third party.
+  `kind: "anchor-rename"` + `anchorTarget` and are keyed under the target,
+  never the page owner — on a third party's page the owner is just someone
+  linking the subject. The anchor label is cut before plain-mention
+  detection, and an anchor is never its own reciprocal edge.
 - **Deterministic layer** — an LLM-independent pass that captures a
   high-value signal *every* run, countering synthesis-agent variance:
   `extract.ts` (regex emails + 12-platform handles), `web-sweep.ts` (snowball
@@ -76,7 +78,10 @@ highest-value catch.
   authors), `twitter-pass.ts` (profile/follow-graph reads), `findings.ts`
   (JSON re-projection), `corroboration.ts` (fusion across source domains;
   the corpus-mention join counts a verbatim Reddit handle disclosure as a
-  reddit-domain source, and locations merge by containment within a person;
+  reddit-domain source, a first-person residence statement ("I live in X",
+  `statesResidence`) does the same for a subject location, and locations
+  merge by containment within a person; with a graph, only clusters it
+  attributes to the subject count toward score, risk and contradictions;
   graph-known namesakes never affect the subject's score/verdict, a subject
   email local-part join adds +1 confidence without another source, and a
   rename / anchor-rename / disclosure edge to the audited handle floors
@@ -109,8 +114,10 @@ highest-value catch.
   searching it beats re-searching the decayed one.
 - **Role mailboxes** — `info@`, `support@`, `abuse@` … (`isRoleMailbox`) are
   identifiers only on the personal site's own domain (`hello@jane.dev` on
-  jane.dev); elsewhere they belong to the vendor or platform. Emails in the
-  subject's own posts join the subject via a `disclosure` edge.
+  jane.dev); elsewhere they belong to the vendor or platform. An address
+  published on its own domain joins the site's owner (the `site-of` handle,
+  or the handle the domain spells) via `email-of`. Emails in the subject's
+  own posts join the subject via a `disclosure` edge.
 - **Seed hygiene** — platform plumbing (`github`, `download`,
   `trending_repos`, …) and vendor mailboxes (`abuse@`, `noreply@`, …) must
   never become search seeds or bridge mention targets: a seed named `github`

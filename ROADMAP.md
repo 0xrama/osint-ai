@@ -19,7 +19,7 @@ identifiers linked into the subject person), false fusion links, and risk
 accuracy vs `expectedRisk`, pinned as ratchet floors in `eval.test.ts`. A grid
 over `calibrateConfidence`'s constants found nothing above the current 7/12
 risk hits: every loosening that lifts a real subject also lifts a namesake.
-The remaining misses are structural (items below), not calibration.
+The misses it left were structural and are now fixed (see Accuracy).
 
 Previously landed (context if picking up mid-stream): the person-level
 identity graph (`identity-graph.ts`, incl. the email local-part join),
@@ -40,12 +40,21 @@ and the deterministic age estimate.
 2. **Phrase-seed queries** — quoted rare n-grams from the subject's Reddit
    history to find cross-posts under other handles: stylometry made
    deterministic.
-3. **More API passes** — the `github-pass.ts` pattern is proven; extend to
-   HN (Algolia, no auth), Bluesky, Mastodon, Keybase (a literal public
-   cross-platform proof graph), Gravatar (email → profile). Port the
-   reference project's multi-source ingestion (Stack Overflow) the same way.
-   The existence probes cover profile *presence* on ~25 sites; these passes
-   add profile *content*.
+3. **Open and archival sources** — only sources Firecrawl or a browser can
+   read without auth; anything behind an API key or login wall is out (X and
+   LinkedIn stay the existing optional passes). In order:
+   a. *Probe hit → scrape*: the existence probes record profile *presence*
+      on ~25 sites; scrape each hit and run the existing extractors and
+      bridge detection over it (HN, npm, Mastodon, Gravatar, Keybase, …).
+   b. *Archive content*: `archive-pass.ts` records Wayback capture dates
+      only; read the earliest/latest captures (`id_` URLs) and add the
+      Common Crawl index as a second archive. A pre-rename capture that
+      mentions the audited handle is a dated bridge.
+   c. *Keybase proofs*: scrape `keybase.io/<h>`, follow each proof link
+      (e.g. the GitHub gist) and check it names the Keybase user; a verified
+      proof is a strong owner-signed graph edge, an unverified one a lead.
+   d. Add-ons: Bluesky PLC audit log (handle history), npm/PyPI package
+      author emails, PGP keyserver name↔email lookups.
 4. **Reddit enrichment fallback** — the `/about.json` probe 403s from
    datacenter IPs. Arctic Shift (already a dependency) may serve account
    metadata; also probe bridge owners' Reddit profiles — cake-day vs
@@ -53,53 +62,27 @@ and the deterministic age estimate.
 
 ## Accuracy
 
-Recently fixed: handle-echo names no longer count as real names; the corpus
-GitHub re-probe runs before synthesis; same-username namesakes split on a
-corpus contradiction; post `selftext` is scanned. Eval (14 fixtures): risk
-13/14, fusion recall 93%, zero false links.
+Eval (14 fixtures): bridge F1 100%, fusion recall 100%, zero false links,
+risk 14/14 — all pinned as ratchet floors. The fixtures are synthetic and
+were written alongside the code, so these pin regressions; they do not
+measure real-world accuracy.
 
-Known misses the eval shows:
-- **Anchor-rename bridge owner** (`anchor-rename-1`, bridge F1 0%) — for
-  `[old](https://x.com/new)` on a third-party page, `bridgeOwnerHandles`
-  lists the page owner instead of the anchor target, and both entries come
-  out `reciprocal: true` / 1.0 with nothing pointing back.
-- **Personal-site emails don't join the owner** (`own-domain-mailbox-1`,
-  fusion 0%) — the sweep knows the site's owner; the graph never links emails
-  found there to it.
-- **Corpus statements aren't evidence without a finding**
-  (`collaborator-commit-1`) — "I live in San Francisco" in the subject's own
-  posts confirms the GitHub location only if the LLM emits a finding.
+Recently fixed: the shared matching library (`match.ts`) and its heuristic
+fixes (disclosure context, bridge-confidence rename edges, `@handle`
+bridges, timezone plateau, link-post URLs, findings quote/permalink
+pairing, age reads only subject text, drift position matching, ranker
+token boost); anchor-rename entries keyed by their link target (a third
+party's page no longer becomes a bridge owner, and an anchor is never its
+own reciprocal); bridge owners join the final mention pass (reciprocity in
+single-round sweeps); with a graph, unowned clusters no longer count for the
+subject; alt-lead sweeps no longer add bridge owners to the subject's list;
+existence probes include the audited username; own-domain emails join the
+site's owner; first-person residence statements corroborate a subject
+location without an LLM finding.
 
-From the pipeline audit (ranked by gain per effort, all verified in code):
-1. **Common-word handles fuse via disclosure** — any discovered handle of 4+
-   characters mentioned as a word ("Microsoft") becomes a 0.8 disclosure edge
-   and Reddit sources. Require handle-shaped context (`@h`, `u/h`, a platform
-   word nearby). `identity-graph.ts` disclosure loop + corroboration corpus join.
-2. **Rename edges ignore bridge confidence** — every non-anchor bridge gets a
-   fixed 0.7 (above the 0.6 merge line), so a one-way 0.5 third-party mention
-   merges. Use the bridge's own confidence; label weak bridges "verify" in
-   prompts.
-3. **Timezone fit skews west for night owls** with false "high" confidence
-   (zero-vs-zero ties). Report the plateau midpoint and width. `timezone.ts`.
-4. **Unknown-owner clusters count for the subject** (`isSubject` undefined
-   passes `!== false`). With a graph present, require `isSubject === true`.
-5. **Link-post URLs are never read** — `RedditPost.url` (a post linking the
-   subject's own GitHub/blog) reaches no extractor, prompt or graph.
-6. **Bridge owners missing from the final mention pass** — reciprocity
-   (A→B and B→A) is never detected for round-1 pages.
-7. **`@handle` never matches the bridge mention regex** (the `@` is excluded
-   from the leading class). Land after #2.
-8. **Findings validation doesn't pair quote with permalink**, accepts
-   `/r/sub`-only permalinks and skips quotes under 8 characters.
-9. **Age pass reads the whole rendered report** (namesake bios, repo years)
-   and degree regexes lack a leading boundary ("maybe" → B.E.).
-10. **Ranker known-handle boost** — substring match against unnormalized text,
-    fed every scraped handle, not just the subject's.
-11. **Drift matching** misses variants in long handles (32-variant cap) and
-    over-merges trailing-digit pairs (`kevinl`~`kevin1`).
-12. **Existence probes skip the audited username**; alt-lead sweeps' bridge
-    owners pollute the primary bridge-owner list.
-
+5. **Held-out real-world fixtures** — freeze a few real runs on accounts
+   the operator controls into fixtures that are never used for tuning, so
+   the eval measures accuracy and not only regressions.
 6. **Timeline coherence** — renames have ordering: the new handle's GitHub/X
    account should predate the old handle's last activity (plus slack). The
    reclaimed-handle check, the age-vs-GitHub-created check, and the archive
@@ -112,4 +95,5 @@ From the pipeline audit (ranked by gain per effort, all verified in code):
    the self-doxx killer feature; blocked on the Milestone 2 provenance
    placeholders in `evidence.ts` (`contentHash`, `retrievedAt`).
 8. **Report polish** — collapse the sweep's single-platform tier into a
-   `<details>` block; add ETA / per-phase progress timing to status output.
+   `<details>` block; add an ETA to status output (per-phase timing is
+   logged and saved as `phaseMs`).
