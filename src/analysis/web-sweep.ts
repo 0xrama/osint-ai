@@ -47,6 +47,7 @@ import {
 import {
   MASTODON_HOST_RE,
   RESERVED_SEED_WORDS,
+  classifyMention,
   findHandleMentions,
   isReservedProfilePath,
   isRoleMailbox,
@@ -54,6 +55,7 @@ import {
   isVendorEmail,
   mentionsHandle,
   snippetAround,
+  type MentionClass,
 } from "./match.ts";
 import { generateDriftVariants, groupDriftKeys } from "./handle-drift.ts";
 import { followWebsite } from "./site-follower.ts";
@@ -71,6 +73,11 @@ export interface BridgeEvidenceEntry {
   target?: string;
   kind?: "anchor-rename";
   anchorTarget?: string;
+  /** `self-reference` when a rename/alt cue sits next to the mention (the page
+   *  owner naming their own old handle); `ambient` otherwise — a link list or
+   *  shoutout that names the handle without claiming it. Ambient entries are
+   *  recorded but score below the person-merge line. */
+  mentionClass?: MentionClass;
   /** Deterministic 0..1 strength score (see scoreBridgeEntry). */
   confidence?: number;
   /** True when the reverse mention edge also exists (A↔B) — a far stronger
@@ -293,7 +300,12 @@ function recordPageBridges(
     const mentions = extractMentions(plain, h);
     if (mentions.length === 0) continue;
     found.push(...mentions);
-    add(ownerHandle.toLowerCase(), { url, snippet: mentions[0], target: h });
+    add(ownerHandle.toLowerCase(), {
+      url,
+      snippet: mentions[0],
+      target: h,
+      mentionClass: classifyMention(plain, h),
+    });
   }
   return found;
 }
@@ -324,33 +336,41 @@ const NOISE_HOST_RE =
  * Deterministic per-entry bridge strength (0..1). Not all bridges weigh the
  * same: an anchor-rename on the subject's own page says far more than a
  * one-way mention on a random third-party page. Classification by the URL the
- * evidence was seen on:
+ * evidence was seen on, then by the mention's own class:
  *   - anchor-rename (label=old, target=new — direction unambiguous): 1.0
- *   - page hosted on a link-aggregator (linktr.ee/… — the owner's own
- *     identity directory): 0.9
- *   - big-platform profile URL (github.com/<owner> etc. — the owner's own
- *     identity surface): 0.8
- *   - anything else (third-party page merely hosting the mention): 0.5
+ *   - self-reference on a link-aggregator page (the owner's own identity
+ *     directory): 0.9
+ *   - self-reference on a big-platform profile URL (the owner's own identity
+ *     surface): 0.8
+ *   - self-reference on a third-party page: 0.6
+ *   - ambient mention (no rename cue — a link list, a shoutout): 0.45, below
+ *     the 0.6 person-merge line, so it stays a lead instead of fusing people
+ * A page that names many DIFFERENT handles is less likely to be about any one
+ * of them, so `fanOut` > 2 costs 0.05 per extra handle (capped at 0.2).
  * A reciprocal reverse edge (A↔B, see computeReciprocal) adds +0.2, capped at
  * 1.0. Pure, rounded to 2 decimals.
  */
 export function scoreBridgeEntry(
-  entry: Pick<BridgeEvidenceEntry, "kind">,
+  entry: Pick<BridgeEvidenceEntry, "kind" | "mentionClass">,
   ownerUrl: string,
   reciprocal = false,
+  fanOut = 1,
 ): number {
   let score: number;
   if (entry.kind === "anchor-rename") {
     score = 1.0;
+  } else if (entry.mentionClass === "ambient") {
+    score = 0.45;
   } else {
     let host = "";
     try { host = new URL(ownerUrl).hostname.toLowerCase(); } catch { host = ""; }
     if (host && LINK_AGGREGATOR_RE.test(host)) score = 0.9;
     else if (host && isBigPlatformHost(host)) score = 0.8;
-    else score = 0.5;
+    else score = entry.mentionClass === "self-reference" ? 0.6 : 0.5;
   }
+  if (fanOut > 2) score -= Math.min(0.2, (fanOut - 2) * 0.05);
   if (reciprocal) score = Math.min(1, score + 0.2);
-  return Math.round(score * 100) / 100;
+  return Math.round(Math.max(0.05, score) * 100) / 100;
 }
 
 /**
@@ -952,11 +972,18 @@ export async function runDeterministicWebSweep(
   // strength score and reciprocal marker now — no downstream consumer has to
   // re-derive them.
   const reciprocalKeys = computeReciprocal(Object.fromEntries(bridgeEvidence));
+  // Distinct mention targets per URL: a page naming many handles is weaker
+  // evidence for each one than a page naming exactly one.
+  const fanOutByUrl = new Map<string, number>();
+  for (const entries of bridgeEvidence.values()) {
+    const targets = new Set(entries.map((e) => e.target ?? "").filter(Boolean));
+    for (const e of entries) fanOutByUrl.set(e.url, targets.size);
+  }
   for (const [owner, entries] of bridgeEvidence) {
     for (const e of entries) {
       const rec = !!e.target && reciprocalKeys.has(`${owner}->${e.target.toLowerCase()}`);
       e.reciprocal = rec;
-      e.confidence = scoreBridgeEntry(e, e.url, rec);
+      e.confidence = scoreBridgeEntry(e, e.url, rec, fanOutByUrl.get(e.url) ?? 1);
     }
   }
 
@@ -1275,13 +1302,16 @@ export function renderWebSweepBlock(result: WebSweepResult): string {
       // Cite bridge evidence verbatim — the stale-badge signature.
       const bridges = ranked.filter((r) => r.bridge && r.bridgeEvidence);
       if (bridges.length > 0) {
-        lines.push(`**🌉 Bridge leads** — a page owned by this handle mentions the audited username \`${result.username}\` (or another discovered handle). This is the signature of a stale cross-reference (renamed handle, old badge, forgotten link) and the strongest attribution lead. The page owner is the subject's **current/active identity** — search this handle on other platforms.`);
+        lines.push(`**🌉 Bridge leads** — a page owned by this handle mentions the audited username \`${result.username}\` (or another discovered handle). This is the signature of a stale cross-reference (renamed handle, old badge, forgotten link) and the strongest attribution lead. A self-reference makes the page owner the subject's **current/active identity** — search this handle on other platforms; an ambient mention is a lead to verify.`);
         lines.push("");
-        lines.push(`*Confidence scale: anchor-rename 1.0 > own link-aggregator page 0.9 > own platform profile 0.8 > third-party page 0.5; a reciprocal (↔ two-way) mention adds +0.2 (capped at 1.0). Labels: HIGH ≥ 0.9, MEDIUM ≥ 0.6, LOW < 0.6.*`);
+        lines.push(`*Confidence scale: anchor-rename 1.0 > own link-aggregator page 0.9 > own platform profile 0.8 > self-reference on a third-party page 0.6 > ambient mention 0.45; a reciprocal (↔ two-way) mention adds +0.2 (capped at 1.0); a page naming many handles is penalized. Labels: HIGH ≥ 0.9, MEDIUM ≥ 0.6, LOW < 0.6.*`);
         lines.push("");
         for (const r of bridges) {
           const confLabel = r.bridgeConfidence !== undefined ? ` [${confidenceLabel(r.bridgeConfidence)} ${r.bridgeConfidence.toFixed(2)}]` : "";
-          lines.push(`- **\`${r.handle}\`** (${r.platforms.join(", ")})${confLabel} — **THIS IS THE CURRENT IDENTITY**. Owner page links back to old handle:`);
+          const verdict = (r.bridgeConfidence ?? 0) < 0.6
+            ? "**ambient mention — verify before treating as the same person**"
+            : "**THIS IS THE CURRENT IDENTITY**";
+          lines.push(`- **\`${r.handle}\`** (${r.platforms.join(", ")})${confLabel} — ${verdict}. Owner page links back to old handle:`);
           for (const ev of r.bridgeEvidence!.slice(0, 2)) {
             const evConf = ev.confidence !== undefined ? ` [${confidenceLabel(ev.confidence)} ${ev.confidence.toFixed(2)}]` : "";
             const rec = ev.reciprocal ? " ↔ reciprocal" : "";
@@ -1374,11 +1404,14 @@ export function renderWebContextForPrompt(result: WebSweepResult): string {
     lines.push("BRIDGE LEADS (HIGHEST PRIORITY) — a page owned by this handle mentions the audited username or another discovered handle. This is the signature of a stale cross-reference (renamed handle, old badge, forgotten link). The PAGE OWNER is likely the subject’s CURRENT/NEW identity — the handle they switched to after renaming. The handle mentioned (the audited username) is the OLD/STALE one. An ANCHOR-RENAME bridge (a link whose visible text is the old handle but whose target is a different profile) is the strongest form — its direction is unambiguous.");
     lines.push("");
     lines.push("KEY INFERENCE: When you see github.com/fixturenew mentioning fixtureveil, it means fixtureveil RENAMED to fixturenew. Search for the NEW handle (fixturenew) on Instagram, YouTube, Twitter, LinkedIn, etc. — that is where their active profiles will be.");
-    lines.push("CONFIDENCE: each bridge carries a deterministic score — anchor-rename 1.0 > own link-aggregator page 0.9 > own platform profile 0.8 > third-party page 0.5, +0.2 for a reciprocal (↔) two-way mention, capped at 1.0. RECIPROCAL and ANCHOR-RENAME bridges are the strongest attribution signals; LOW-confidence one-way third-party mentions may be ambient (a namesake mention) — verify before treating them as rename evidence.");
+    lines.push("CONFIDENCE: each bridge carries a deterministic score — anchor-rename 1.0 > own link-aggregator page 0.9 > own platform profile 0.8 > self-reference on a third-party page 0.6 > ambient mention 0.45, +0.2 for a reciprocal (↔) two-way mention, capped at 1.0, minus a small penalty when one page names many handles. RECIPROCAL and ANCHOR-RENAME bridges are the strongest attribution signals; an AMBIENT mention (no rename cue — a link list, a shoutout) is a lead, not a rename — verify before treating it as the same person.");
     lines.push("");
     for (const r of bridges) {
       const confLabel = r.bridgeConfidence !== undefined ? ` [${confidenceLabel(r.bridgeConfidence)} ${r.bridgeConfidence.toFixed(2)}]` : "";
-      lines.push(`- **${r.handle}** (${r.platforms.join(", ")})${confLabel} — THIS IS THE CURRENT IDENTITY. Search for \`${r.handle}\` on other platforms.`);
+      const verdict = (r.bridgeConfidence ?? 0) < 0.6
+        ? "ambient mention — a lead, not a confirmed rename; verify before attributing"
+        : "THIS IS THE CURRENT IDENTITY. Search for it on other platforms.";
+      lines.push(`- **${r.handle}** (${r.platforms.join(", ")})${confLabel} — ${verdict}`);
       for (const ev of r.bridgeEvidence!.slice(0, 2)) {
         const evConf = ev.confidence !== undefined ? ` [${confidenceLabel(ev.confidence)} ${ev.confidence.toFixed(2)}]` : "";
         const rec = ev.reciprocal ? " [↔ RECIPROCAL]" : "";

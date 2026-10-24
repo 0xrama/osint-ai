@@ -72,7 +72,8 @@ highest-value catch.
   high-value signal *every* run, countering synthesis-agent variance:
   `extract.ts` (regex emails + 12-platform handles), `web-sweep.ts` (snowball
   search/scrape/extract + bridges), `handle-drift.ts` (drift families),
-  `timezone.ts` (posting-time UTC-offset fit), `age.ts` (degree-timeline age
+  `timezone.ts` (posting-time UTC-offset fit + a coarse place→offset table),
+  `age.ts` (degree-timeline age
   arithmetic), `existence-probe.ts` + `archive-pass.ts` (profile probes and
   Wayback snapshots as leads), `github-pass.ts` (REST profile + commit
   authors), `twitter-pass.ts` (profile/follow-graph reads), `findings.ts`
@@ -86,9 +87,11 @@ highest-value catch.
   email local-part join adds +1 confidence without another source, and a
   rename / anchor-rename / disclosure edge to the audited handle floors
   `overallRisk` at medium — high with a real name and email — without adding
-  sources),
+  sources; the deterministic falsifiers cross-check each other — a
+  medium/high posting-time fit contradicts a subject location on the other
+  side of the world, and a model age far from the `age.ts` range contradicts),
   `identity-graph.ts` (person-level fusion; splits namesakes from the
-  subject).
+  subject, and dates a rename against the accounts' creation).
   **Deterministic before LLM**: when a signal can be captured by regex, scan,
   or direct API read, capture it that way and treat the LLM as the reasoning
   layer on top — never the source of truth.
@@ -129,7 +132,8 @@ highest-value catch.
   two modes: *bridge* (web pages: hyphen-joined tokens, `@h` counts, emails
   don't) and *disclosure* (the subject's own posts: needs handle-shaped
   context — `@h`, `u/h`, a URL, a platform word — so "I interned at
-  Microsoft" never links `microsoft`). Never re-implement a matcher.
+  Microsoft" never links `microsoft`; a third-party cue like "my friend's
+  github is h" downgrades it to a 0.5 lead). Never re-implement a matcher.
 - **Drift** — digit/letter variant families (`l`↔`1`, `o`↔`0`, `s`↔`5`, …)
   in `handle-drift.ts`: `fixtureveil` ≈ `fixtureve1l`. Grouped pairwise via
   union-find because the confusable map is not injective (`i` and `l` both
@@ -148,7 +152,16 @@ highest-value catch.
   person. A GitHub/X account whose login equals the audited username is split
   off (`handle:<key>@<platform>`) when nothing links it to the subject and the
   subject's posts contradict its location/company. Profile "names" must pass
-  `nameLooksReal` (2+ capitalized tokens) to count as real names. Synthesis is instructed to never attribute namesake activity to
+  `nameLooksReal` (2+ capitalized tokens) to count as real names. Fusion is
+  not flat: each node's **linkage** to the audited node is its strongest
+  max-product path over merging edges (transitivity decays — two chained 0.6
+  bridges = 0.36, one 1.0 anchor = 1.0), and nodes below 0.5 split off as
+  leads instead of joining the subject. Persons are **ranked by support**
+  (linkage + identifier kinds + platform breadth − contradicted bridges + a
+  supplied candidate-name match) and the margin to the runner-up is reported:
+  a namesake on top means the bridge evidence is weak. A rename whose new
+  account was created more than a year after the old handle's last archived
+  capture is downgraded the same way and marked `incoherent`. Synthesis is instructed to never attribute namesake activity to
   the subject, and the report carries the graph as an `## Identity Graph`
   block. Existence probes and archive snapshots are *leads* in the same
   spirit: existence ≠ same person.

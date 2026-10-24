@@ -195,6 +195,27 @@ export function nameLooksReal(name: string, handle?: string): boolean {
   return tokens.some((t) => /^[A-ZÀ-Ž]/.test(t));
 }
 
+/** Normalize a personal name for comparison: lowercase, collapse whitespace,
+ *  strip punctuation that separates name tokens (keeps internal initials). */
+export function normalizeName(raw: string): string {
+  return raw.toLowerCase().replace(/[.,;:!?'"—–-]+/g, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Tokenize a name for overlap matching: lowercase, drop tokens < 2 chars. */
+export function nameTokens(raw: string): string[] {
+  const t = normalizeName(raw).split(/\s+/).filter((tok) => tok.length >= 2);
+  return [...new Set(t)];
+}
+
+/** Do two names share enough tokens to be the same person? Two shared tokens,
+ *  or one shared token of ≥3 chars (a lone surname match). */
+export function namesOverlap(a: string, b: string): boolean {
+  const ta = nameTokens(a);
+  const tb = nameTokens(b);
+  const shared = tb.filter((t) => ta.includes(t));
+  return shared.length >= 2 || (shared.length === 1 && shared[0].length >= 3);
+}
+
 /* ────────────────────────────────────────────────────────────────────────
  * Mention detection
  * ──────────────────────────────────────────────────────────────────────── */
@@ -255,15 +276,56 @@ const MY_IS_RE = /\bmy\b[^.!?\n]{0,30}?(?:\bis\b|[:=])\s*["'`]?$/i;
 /** Context window (chars) on each side of a hit for HANDLE_CONTEXT_RE. */
 const CONTEXT_WINDOW = 40;
 
+/** Cues that a nearby mention is the writer's OWN identity: rename history or
+ *  an alt-account note. This is what separates a stale-badge bridge from a
+ *  link list that happens to name the handle. */
+const SELF_REFERENCE_CUE =
+  /\b(?:previously|formerly|aka|a\.k\.a\.?|also known as|old (?:handle|account|username|name)|renamed (?:from|to)|used to be|my (?:old|new|alt|other|main|backup|second) (?:handle|account|username)|alt(?:ernate)? account|main account|backup account)\b/i;
+
+/** Cues that the mentioned handle belongs to SOMEONE ELSE ("my friend's github
+ *  is h", "check out h"). */
+const THIRD_PARTY_CUE =
+  /\b(?:my (?:friend|buddy|colleague|coworker|brother|sister|partner|roommate)(?:'s|s')?|a friend(?:'s)?|shoutout to|credit(?:s)? to|thanks to|inspired by|follow (?:him|her|them))\b/i;
+
+/** How a bridge-mode mention relates to the page owner. */
+export type MentionClass = "self-reference" | "ambient";
+
 /**
- * Offset of the first place the subject's own text DISCLOSES `handle`, or -1.
- * A disclosure is a bridge-mode token hit in handle-shaped context: `@h`,
- * `u/h` or a non-table URL ending in h, a platform/identity word within ~40
- * chars ("my discord is h", "h on github"), or "my … is h". Plain prose
- * ("I interned at Microsoft") never counts — a discovered handle that is also
- * an ordinary word must not fabricate a 0.8 disclosure edge.
+ * Classify a bridge-mode mention of `handle` by the cues around it.
+ * `self-reference` = a rename/alt cue sits within the context window (the
+ * writer is naming their own old handle); everything else is `ambient` — a
+ * mention that may just be a link list or a shoutout. Bridge scoring keeps
+ * ambient mentions below the person-merge line: they are recorded as leads,
+ * not as identity fusion.
  */
-export function disclosesHandle(text: string, handle: string): number {
+export function classifyMention(text: string, handle: string): MentionClass {
+  const len = handle.replace(/^@/, "").length;
+  for (const start of tokenHits(text, handle)) {
+    const before = text.slice(Math.max(0, start - CONTEXT_WINDOW), start);
+    const after = text.slice(start + len, start + len + CONTEXT_WINDOW);
+    const window = `${before} ${after}`;
+    // A third-party cue beats the nearby platform word ("my friend's github is h").
+    if (THIRD_PARTY_CUE.test(before)) continue;
+    if (MY_IS_RE.test(before) || SELF_REFERENCE_CUE.test(window)) return "self-reference";
+    if (HANDLE_CONTEXT_RE.test(window)) return "self-reference";
+  }
+  return "ambient";
+}
+
+/** Who a disclosure names: the writer (`self`) or someone they point at. */
+export type DisclosureKind = "self" | "third-party";
+
+/**
+ * First place the subject's own text DISCLOSES `handle`, with its kind, or
+ * null. A disclosure is a bridge-mode token hit in handle-shaped context:
+ * `@h`, `u/h` or a non-table URL ending in h, a platform/identity word within
+ * ~40 chars ("my discord is h", "h on github"), or "my … is h". A third-party
+ * cue ("my friend's github is h") downgrades the link — the handle is real but
+ * it may be a different person. Plain prose ("I interned at Microsoft") never
+ * counts, so a discovered handle that is also an ordinary word cannot
+ * fabricate a disclosure edge.
+ */
+export function disclosureKind(text: string, handle: string): { kind: DisclosureKind; index: number } | null {
   const len = handle.replace(/^@/, "").length;
   // Profile URLs from the platform table are the corpus regex extractor's
   // observation (counted there, once); blank them (offsets preserved) so a
@@ -272,12 +334,19 @@ export function disclosesHandle(text: string, handle: string): number {
   for (const { pattern } of SOCIAL_PATTERNS) verbal = verbal.replace(pattern, (m) => " ".repeat(m.length));
   for (const start of tokenHits(verbal, handle)) {
     const prev = verbal[start - 1];
-    if (prev === "@" || prev === "/") return start;
+    if (prev === "@" || prev === "/") return { kind: "self", index: start };
     const before = verbal.slice(Math.max(0, start - CONTEXT_WINDOW), start);
     const after = verbal.slice(start + len, start + len + CONTEXT_WINDOW);
-    if (MY_IS_RE.test(before) || HANDLE_CONTEXT_RE.test(`${before} ${after}`)) return start;
+    if (THIRD_PARTY_CUE.test(before)) return { kind: "third-party", index: start };
+    if (MY_IS_RE.test(before)) return { kind: "self", index: start };
+    if (HANDLE_CONTEXT_RE.test(`${before} ${after}`)) return { kind: "self", index: start };
   }
-  return -1;
+  return null;
+}
+
+/** Offset of the first disclosure of `handle` (either kind), or -1. */
+export function disclosesHandle(text: string, handle: string): number {
+  return disclosureKind(text, handle)?.index ?? -1;
 }
 
 /** First-person residence cues: a place named right after one is where the

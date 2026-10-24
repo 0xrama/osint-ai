@@ -4,7 +4,23 @@ Prioritized next work on osint-ai. Each item names the failure mode it kills.
 Done items are removed — git history and AGENTS.md's concept definitions carry
 the past.
 
-Implemented most recently: person-aware corroboration (namesake clusters do
+Implemented most recently: the deterministic falsifiers — a medium/high
+posting-time fit contradicts a subject location on the other side of the
+world, a model age far from the `age.ts` range contradicts, and a rename whose
+new account post-dates the old handle's last archived capture by over a year
+is downgraded as `incoherent`.
+
+Previously: path-strength linkage (max-product path from the
+audited node; a chain of weak bridges no longer fuses a blob) and competing
+hypotheses — persons are ranked by support with the margin to the runner-up,
+and `--subject-name` is a candidate the ranking tests.
+
+Before that: bridge mention classes (self-reference vs ambient,
+with a per-page fan-out penalty) and generalized negative evidence — a bridged
+profile the subject's posts contradict is downgraded to a namesake, and a
+third-party disclosure ("my friend's github is h") is a lead, not a fusion.
+
+Previously: person-aware corroboration (namesake clusters do
 not affect the subject's score/verdict; contradictions stay within a person)
 and the graph-backed email local-part confidence bonus (+1, no extra source),
 structured account verification labels (constrain-only), and document-level
@@ -12,7 +28,8 @@ source deduplication via canonical URLs.
 
 Also implemented: a deterministic `--subject-name` consistency check
 (CONSISTENT / INCONCLUSIVE / CONFLICTING) over subject-owned name clusters,
-including attributed GitHub commit names. Read-only: never changes the score.
+including attributed GitHub commit names. The check itself is read-only; the
+same candidate also feeds the graph's support ranking.
 
 Also implemented: the eval fusion metric — per-fixture fusion recall (true
 identifiers linked into the subject person), false fusion links, and risk
@@ -83,17 +100,11 @@ location without an LLM finding.
 5. **Held-out real-world fixtures** — freeze a few real runs on accounts
    the operator controls into fixtures that are never used for tuning, so
    the eval measures accuracy and not only regressions.
-6. **Timeline coherence** — renames have ordering: the new handle's GitHub/X
-   account should predate the old handle's last activity (plus slack). The
-   reclaimed-handle check, the age-vs-GitHub-created check, and the archive
-   pass's pre-cake-day flags each cover a slice; a single coherence check
-   over the join dates would tie them together.
-
 ## Measurement & UX
 
-7. **Run-over-run leak diff** — "new identifiers since the last audit" is
+6. **Run-over-run leak diff** — "new identifiers since the last audit" is
    the self-doxx killer feature; blocked on the Milestone 2 provenance
    placeholders in `evidence.ts` (`contentHash`, `retrievedAt`).
-8. **Report polish** — collapse the sweep's single-platform tier into a
+7. **Report polish** — collapse the sweep's single-platform tier into a
    `<details>` block; add an ETA to status output (per-phase timing is
    logged and saved as `phaseMs`).

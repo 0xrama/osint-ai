@@ -21,6 +21,11 @@
  *      reclaimed-handle (squatter) warnings when a handle's account post-dates
  *      the subject's Reddit account.
  *
+ * Two deterministic falsifiers cross-check the above rather than adding
+ * sources: the posting-time UTC-offset fit contradicts a subject location on
+ * the other side of the world, and the degree-timeline age range contradicts a
+ * model/profile age far outside it.
+ *
  * It clusters assertions about the same entity (handle / email / location /
  * employer / real name / age), counts INDEPENDENT sources per cluster, maps the
  * source breakdown to a calibrated low/medium/high confidence, detects
@@ -43,7 +48,22 @@ import { normalizeHandleKey, type DirectIdentifiers } from "./extract.ts";
 import { profileRootHandle, rankHandles, type WebSweepResult } from "./web-sweep.ts";
 import type { GitHubPassResult, GitHubIdentity } from "./github-pass.ts";
 import { isReclaimedHandle, type TwitterPassResult } from "./twitter-pass.ts";
-import { disclosesHandle, isContentlessEmail, mentionsHandle, nameLooksReal, snippetAround, statesResidence } from "./match.ts";
+import { timezoneConflictsWithPlace, type TimezoneEstimate } from "./timezone.ts";
+import type { AgeEstimate } from "./age.ts";
+import {
+  disclosureKind,
+  isContentlessEmail,
+  mentionsHandle,
+  nameLooksReal,
+  nameTokens,
+  normalizeName,
+  snippetAround,
+  statesResidence,
+} from "./match.ts";
+
+/* Name normalization lives in match.ts (shared with the identity graph's
+ * candidate ranking); re-exported so existing imports keep working. */
+export { nameTokens, normalizeName } from "./match.ts";
 import type { AccountStatus, StructuredFindings, Finding, FindingCategory } from "./findings.ts";
 import { canonicalSourceUrl, buildVerdict, emptyVerdict, type AuditVerdict } from "./evidence.ts";
 import type { IdentityGraph, PersonEntity } from "./identity-graph.ts";
@@ -56,7 +76,8 @@ export type SignalType =
   | "real_name"
   | "age"
   | "handle"
-  | "email";
+  | "email"
+  | "timezone";
 
 /** Confidence buckets — reuse the report-wide vocabulary. */
 export type Confidence = "low" | "medium" | "high";
@@ -151,6 +172,11 @@ export interface CorroborationInput {
    *  credit each mentioning text as one reddit-domain source — a handle the
    *  subject disclosed on Reddit must not register as web-only. */
   corpusTexts?: Array<{ text: string; permalink?: string }>;
+  /** Deterministic posting-time UTC-offset fit — falsifies a profile location
+   *  on the other side of the world. */
+  timezone?: TimezoneEstimate | null;
+  /** Deterministic degree-timeline age estimates — falsify model/profile ages. */
+  ageEstimates?: AgeEstimate[];
 }
 
 /** Options for deterministic tests (inject a fixed "now" for age math). */
@@ -193,19 +219,8 @@ export function normalizeEmployer(raw: string): string {
   return c.trim();
 }
 
-/**
- * Normalize a personal name: lowercase, collapse whitespace, strip punctuation
- * that separates name tokens (keeps internal single-letter initials).
- */
-export function normalizeName(raw: string): string {
-  return clean(raw).replace(/[.,;:!?'"—–-]+/g, " ").replace(/\s+/g, " ").trim();
-}
-
-/** Tokenize a name for overlap matching: lowercase, drop tokens < 2 chars. */
-export function nameTokens(raw: string): string[] {
-  const t = normalizeName(raw).split(/\s+/).filter((tok) => tok.length >= 2);
-  return [...new Set(t)];
-}
+/* Name normalization + tokenization live in match.ts (shared with the
+ * identity graph's candidate ranking) and are re-exported above. */
 
 export interface CandidateHypothesisCheck {
   name: string;
@@ -992,8 +1007,14 @@ function computeInner(
         const ct = corpusTexts[i];
         const text = String(ct?.text ?? "");
         if (!text) continue;
+        // Only a SELF disclosure counts as a reddit-domain source; "my friend's
+        // github is h" names someone else's account and must not corroborate it.
+        let hit: string | undefined;
         let idx = -1;
-        const hit = spellings.find((s) => (idx = disclosesHandle(text, s)) >= 0);
+        for (const s of spellings) {
+          const d = disclosureKind(text, s);
+          if (d?.kind === "self") { hit = s; idx = d.index; break; }
+        }
         if (!hit) continue;
         const permalink = normPermalink(String(ct?.permalink ?? ""));
         addToCluster(
@@ -1100,6 +1121,15 @@ function computeInner(
       const permalink = normPermalink(String(ct?.permalink ?? ""));
       addToCluster(acc, "reddit", `corpus:${permalink || i}`, permalink || snippetAround(text, idx, hit.length));
     });
+  }
+
+  // The deterministic posting-time fit is itself an observation (single
+  // source, direct domain). It is not an identity anchor — it exists to
+  // falsify a profile location on the other side of the world.
+  if (input.timezone && input.timezone.confidence !== "low") {
+    const tz = input.timezone;
+    const acc = findOrCreate("timezone", tz.label, tz.label, "direct", subject);
+    addToCluster(acc, "direct", `tz:${tz.offsetMinutes}`, tz.label);
   }
 
   // Attach GitHub account-created year to age clusters for contradiction math.
@@ -1280,6 +1310,36 @@ function computeInner(
         );
         ageCl.contradictions = [...(ageCl.contradictions ?? []), `GitHub account created ${createdYear}`];
       }
+    }
+  }
+
+  // Cross-type: posting-time fit vs a subject location on the other side of
+  // the world. Two deterministic passes falsifying each other — the fit is
+  // only trusted at medium/high confidence, and unknown places never conflict.
+  const tz = input.timezone;
+  if (tz && tz.confidence !== "low") {
+    for (const loc of locationClusters) {
+      if (!forSubject(loc)) continue;
+      if (!timezoneConflictsWithPlace(tz.offsetMinutes, loc.value)) continue;
+      contradictions.push(`Posting-time fit ${tz.label} conflicts with location "${loc.value}"`);
+      loc.contradictions = [...(loc.contradictions ?? []), `posting-time fit ${tz.label}`];
+    }
+  }
+
+  // Cross-type: model/profile age vs the deterministic degree-timeline range.
+  // Only a gap wider than 2 years counts — the estimate is a range, not a point.
+  for (const ageCl of byType("age")) {
+    if (!forSubject(ageCl)) continue;
+    const parsed = parseAge(ageCl.value);
+    if (!parsed) continue;
+    const [lo, hi] = typeof parsed === "number" ? [parsed, parsed] : parsed;
+    for (const est of input.ageEstimates ?? []) {
+      const [estLo, estHi] = est.ageRange;
+      if (lo <= estHi + 2 && hi >= estLo - 2) continue;
+      contradictions.push(
+        `Age estimate (${ageCl.value}) conflicts with the deterministic timeline (${estLo}–${estHi})`,
+      );
+      ageCl.contradictions = [...(ageCl.contradictions ?? []), `deterministic timeline ${estLo}–${estHi}`];
     }
   }
 
@@ -1476,6 +1536,7 @@ const SIGNAL_LABEL: Record<SignalType, string> = {
   age: "age",
   handle: "handle",
   email: "email",
+  timezone: "timezone",
 };
 
 /** Render the corroboration result as a "## Cross-Signal Corroboration" block. */

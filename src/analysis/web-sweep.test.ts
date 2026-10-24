@@ -368,6 +368,23 @@ describe("web-sweep bridge confidence scoring (scoreBridgeEntry)", () => {
 		expect(scoreBridgeEntry({}, "https://randomblog.example/article", true)).toBe(0.7);
 		expect(scoreBridgeEntry({ kind: "anchor-rename" }, "https://x.com/fixturenew", true)).toBe(1);
 	});
+
+	test("an ambient mention stays below the 0.6 person-merge line", () => {
+		expect(scoreBridgeEntry({ mentionClass: "ambient" }, "https://github.com/fixturenew")).toBe(0.45);
+		expect(scoreBridgeEntry({ mentionClass: "ambient" }, "https://linktr.ee/fixturenew")).toBe(0.45);
+		// reciprocity can still lift it over the line
+		expect(scoreBridgeEntry({ mentionClass: "ambient" }, "https://randomblog.example/a", true)).toBe(0.65);
+	});
+
+	test("a self-reference on a third-party page is 0.6", () => {
+		expect(scoreBridgeEntry({ mentionClass: "self-reference" }, "https://randomblog.example/a")).toBe(0.6);
+	});
+
+	test("a page naming many handles is penalized per extra handle, capped at 0.2", () => {
+		expect(scoreBridgeEntry({}, "https://github.com/fixturenew", false, 2)).toBe(0.8);
+		expect(scoreBridgeEntry({}, "https://github.com/fixturenew", false, 3)).toBe(0.75);
+		expect(scoreBridgeEntry({}, "https://github.com/fixturenew", false, 10)).toBe(0.6);
+	});
 });
 
 describe("web-sweep reciprocity detection (computeReciprocal)", () => {

@@ -2,8 +2,10 @@ import { describe, expect, test } from "bun:test";
 import {
   estimateUtcOffset,
   formatOffsetLabel,
+  placeOffsetRange,
   renderTimezoneBlock,
   renderTimezoneContextForPrompt,
+  timezoneConflictsWithPlace,
 } from "./timezone.ts";
 
 /**
@@ -147,5 +149,31 @@ describe("render helpers", () => {
     expect(line).toContain("UTC+05:30");
     expect(line).toContain("54");
     expect(line).not.toContain("\n");
+  });
+});
+
+describe("placeOffsetRange / timezoneConflictsWithPlace", () => {
+  test("known places resolve to a plausible range", () => {
+    expect(placeOffsetRange("Hyderabad, India")).toEqual([330, 330]);
+    expect(placeOffsetRange("London, UK")).toEqual([0, 60]);
+    expect(placeOffsetRange("Tokyo, Japan")).toEqual([540, 540]);
+  });
+
+  test("unknown places never conflict", () => {
+    expect(placeOffsetRange("Somewhereville")).toBeNull();
+    expect(timezoneConflictsWithPlace(330, "Somewhereville")).toBe(false);
+  });
+
+  test("a fit on the other side of the world conflicts", () => {
+    expect(timezoneConflictsWithPlace(330, "Tokyo, Japan")).toBe(true);
+    expect(timezoneConflictsWithPlace(-300, "Hyderabad, India")).toBe(true);
+  });
+
+  test("a fit inside the range or within the slack does not conflict", () => {
+    expect(timezoneConflictsWithPlace(330, "Hyderabad, India")).toBe(false);
+    // +05:30 vs a UK range of 0..60 is 270 min out — inside the 180-min slack? No: 330-60=270 > 180.
+    expect(timezoneConflictsWithPlace(330, "London, UK")).toBe(true);
+    // +01:00 is 60 min outside the UK range — within slack.
+    expect(timezoneConflictsWithPlace(120, "London, UK")).toBe(false);
   });
 });

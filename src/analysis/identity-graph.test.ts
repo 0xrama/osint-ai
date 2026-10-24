@@ -207,7 +207,7 @@ describe("identity graph: drift edges", () => {
     const drift = edgeBetween(graph, "handle:fixtureveil", "handle:fixtureve1l");
     expect(drift).toBeDefined();
     expect(drift!.kind).toBe("drift");
-    expect(drift!.strength).toBe(0.6);
+    expect(drift!.strength).toBe(0.7);
 
     // The drift edge fuses both spellings into the subject person.
     const subject = graph.persons.find((p) => p.isSubject)!;
@@ -303,7 +303,7 @@ describe("identity graph: corpus disclosures", () => {
 });
 
 describe("identity graph: email local-part join", () => {
-  test("johndoe@gmail.com ties to the johndoe handle node at 0.6", () => {
+  test("johndoe@gmail.com ties to the johndoe handle node at 0.7", () => {
     const graph = buildIdentityGraph({
       username: "fixtureveil",
       webSweep: makeSweep({
@@ -319,7 +319,7 @@ describe("identity graph: email local-part join", () => {
     const join = edgeBetween(graph, "handle:johndoe", "email:johndoe@gmail.com");
     expect(join).toBeDefined();
     expect(join!.kind).toBe("email-of");
-    expect(join!.strength).toBe(0.6);
+    expect(join!.strength).toBe(0.7);
   });
 });
 
@@ -461,5 +461,234 @@ describe("identity graph: rename strength follows bridge confidence", () => {
     const g = graphFor("https://github.com/fixturenew", 0.8);
     expect(edgeBetween(g, "handle:fixturenew", "handle:fixtureveil")?.strength).toBe(0.8);
     expect(subjectHas(g, "handle:fixturenew")).toBe(true);
+  });
+});
+
+describe("identity graph: negative evidence on bridges", () => {
+  const bridged = (location: string, posts: string[]) =>
+    buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        bridgeEvidence: {
+          fixturenew: [{
+            url: "https://github.com/fixturenew",
+            snippet: "formerly fixtureveil",
+            target: "fixtureveil",
+            mentionClass: "self-reference",
+          }],
+        },
+      }),
+      gitHub: makeGitHub({
+        identities: [{
+          login: "fixturenew", url: "https://github.com/fixturenew", location,
+          commitAuthors: [], commitStats: { scanned: 0, attributed: 0, excluded: 0 },
+        }],
+      }),
+      corpusTexts: posts.map((text, i) => ({ text, permalink: `/r/a/comments/${i}/` })),
+    });
+
+  test("a bridged handle whose profile the subject's posts contradict is a namesake", () => {
+    const graph = bridged("Tokyo, Japan", ["I live in Manchester these days"]);
+    const edge = edgeBetween(graph, "handle:fixturenew", "handle:fixtureveil")!;
+    expect(edge.contradicted).toBe(true);
+    expect(edge.strength).toBe(0.45);
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).not.toContain("handle:fixturenew");
+    expect(graph.persons.find((p) => p.handleNodes.includes("handle:fixturenew"))?.isSubject).toBe(false);
+    expect(renderIdentityGraphBlock(graph, "fixtureveil")).toContain("contradicted by the subject's own posts");
+  });
+
+  test("an agreeing profile keeps the bridge fused", () => {
+    const graph = bridged("Manchester, UK", ["I live in Manchester these days"]);
+    expect(edgeBetween(graph, "handle:fixturenew", "handle:fixtureveil")?.contradicted).toBeUndefined();
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).toContain("handle:fixturenew");
+  });
+
+  test("a silent corpus keeps the bridge fused", () => {
+    const graph = bridged("Tokyo, Japan", ["nice weather today"]);
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).toContain("handle:fixturenew");
+  });
+});
+
+describe("identity graph: third-party disclosures", () => {
+  test("a third-party disclosure is a lead, not a fusion", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        identifiers: {
+          emails: [],
+          socialHandles: [{ platform: "github", handle: "fixturefriend", url: "https://github.com/fixturefriend" }],
+        },
+      }),
+      corpusTexts: [{ text: "my friend's github is fixturefriend", permalink: "/r/a/comments/1/" }],
+    });
+    const edge = edgeBetween(graph, "handle:fixturefriend", "handle:fixtureveil")!;
+    expect(edge.kind).toBe("disclosure");
+    expect(edge.strength).toBe(0.45);
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).not.toContain("handle:fixturefriend");
+  });
+
+  test("a self disclosure still fuses", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        identifiers: {
+          emails: [],
+          socialHandles: [{ platform: "github", handle: "fixturenew", url: "https://github.com/fixturenew" }],
+        },
+      }),
+      corpusTexts: [{ text: "my github is fixturenew", permalink: "/r/a/comments/1/" }],
+    });
+    expect(edgeBetween(graph, "handle:fixturenew", "handle:fixtureveil")?.strength).toBe(0.8);
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).toContain("handle:fixturenew");
+  });
+});
+
+describe("identity graph: linkage decay", () => {
+  test("a chain of two weak bridges does not drag the far end into the subject", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        identifiers: {
+          emails: [],
+          socialHandles: [
+            { platform: "github", handle: "midlink", url: "https://github.com/midlink" },
+            { platform: "github", handle: "farlink", url: "https://github.com/farlink" },
+            { platform: "x", handle: "farlink", url: "https://x.com/farlink" },
+          ],
+        },
+        bridgeEvidence: {
+          midlink: [{ url: "https://blog.example/a", snippet: "formerly fixtureveil", target: "fixtureveil", mentionClass: "self-reference" }],
+          farlink: [{ url: "https://blog.example/b", snippet: "formerly midlink", target: "midlink", mentionClass: "self-reference" }],
+        },
+      }),
+    });
+    const subject = graph.persons.find((p) => p.isSubject)!;
+    expect(subject.handleNodes).toContain("handle:midlink");
+    expect(subject.handleNodes).not.toContain("handle:farlink");
+    // 0.6 × 0.6 = 0.36 — below the linkage floor.
+    expect(graph.persons.find((p) => p.handleNodes.includes("handle:farlink"))?.linkage).toBe(0);
+  });
+
+  test("a strong anchor carries a downstream drift spelling", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        identifiers: {
+          emails: [],
+          socialHandles: [{ platform: "github", handle: "fixtureve1l", url: "https://github.com/fixtureve1l" }],
+        },
+        bridgeEvidence: {
+          fixturenew: [{
+            url: "https://dir.example/", snippet: "[fixtureveil](https://x.com/fixturenew)",
+            target: "fixtureveil", kind: "anchor-rename", anchorTarget: "fixturenew",
+          }],
+        },
+      }),
+    });
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).toContain("handle:fixtureve1l");
+  });
+});
+
+describe("identity graph: candidate ranking", () => {
+  // Subject: one weak third-party bridge. Namesake: a rich, unlinked profile.
+  const ranked = (candidateName?: string) =>
+    buildIdentityGraph({
+      username: "fixtureveil",
+      candidateName,
+      webSweep: makeSweep({
+        identifiers: {
+          emails: [],
+          socialHandles: [
+            { platform: "github", handle: "weakowner", url: "https://github.com/weakowner" },
+            { platform: "github", handle: "richfan", url: "https://github.com/richfan" },
+            { platform: "x", handle: "richfan", url: "https://x.com/richfan" },
+          ],
+        },
+        bridgeEvidence: {
+          weakowner: [{ url: "https://blog.example/a", snippet: "formerly fixtureveil", target: "fixtureveil", mentionClass: "self-reference", confidence: 0.6 }],
+        },
+      }),
+      gitHub: makeGitHub({
+        identities: [{
+          login: "richfan", url: "https://github.com/richfan", name: "Rich Fan",
+          email: "rich@fan.dev", commitAuthors: [], commitStats: { scanned: 0, attributed: 0, excluded: 0 },
+        }],
+      }),
+    });
+
+  test("a rich namesake outranks a lone weak bridge and the margin is negative", () => {
+    const graph = ranked();
+    expect(graph.persons[0].isSubject).toBe(false);
+    expect(graph.margin).toBeGreaterThan(0);
+    expect(renderIdentityGraphBlock(graph, "fixtureveil")).toContain("a namesake outranks the subject person");
+    expect(renderIdentityGraphContextForPrompt(graph, "fixtureveil")).toContain("a namesake outranks");
+  });
+
+  test("a supplied candidate name lifts the matching person", () => {
+    const graph = ranked("Rich Fan");
+    const fan = graph.persons.find((p) => p.nameNodes.includes("name:rich fan"))!;
+    expect(fan.candidateMatch).toBe(true);
+    expect(renderIdentityGraphBlock(graph, "fixtureveil")).toContain("candidate-name match");
+  });
+});
+
+describe("identity graph: timeline coherence", () => {
+  const graphFor = (accountCreated: string, lastSnapshot: string) =>
+    buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        bridgeEvidence: {
+          fixturenew: [{
+            url: "https://github.com/fixturenew", snippet: "formerly fixtureveil",
+            target: "fixtureveil", mentionClass: "self-reference", confidence: 0.8,
+          }],
+        },
+      }),
+      gitHub: makeGitHub({
+        identities: [{
+          login: "fixturenew", url: "https://github.com/fixturenew", accountCreated,
+          commitAuthors: [], commitStats: { scanned: 0, attributed: 0, excluded: 0 },
+        }],
+      }),
+      archivePass: {
+        snapshots: [{
+          url: "x.com/fixtureveil/", firstSnapshot: "20190101000000",
+          lastSnapshot, count: 3,
+        }],
+      },
+    });
+
+  test("a new account created long after the old handle's last capture is incoherent", () => {
+    const graph = graphFor("2024-01-01T00:00:00Z", "20200101000000");
+    const edge = edgeBetween(graph, "handle:fixturenew", "handle:fixtureveil")!;
+    expect(edge.incoherent).toBe(true);
+    expect(edge.strength).toBe(0.45);
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).not.toContain("handle:fixturenew");
+    expect(renderIdentityGraphBlock(graph, "fixtureveil")).toContain("chronologically implausible rename");
+  });
+
+  test("a new account created before the old handle went quiet stays coherent", () => {
+    const graph = graphFor("2019-06-01T00:00:00Z", "20200101000000");
+    const edge = edgeBetween(graph, "handle:fixturenew", "handle:fixtureveil")!;
+    expect(edge.incoherent).toBeUndefined();
+    expect(graph.persons.find((p) => p.isSubject)!.handleNodes).toContain("handle:fixturenew");
+  });
+
+  test("without archive dates the check never fires", () => {
+    const graph = buildIdentityGraph({
+      username: "fixtureveil",
+      webSweep: makeSweep({
+        bridgeEvidence: {
+          fixturenew: [{ url: "https://github.com/fixturenew", snippet: "formerly fixtureveil", target: "fixtureveil", mentionClass: "self-reference", confidence: 0.8 }],
+        },
+      }),
+      gitHub: makeGitHub({
+        identities: [{
+          login: "fixturenew", url: "https://github.com/fixturenew", accountCreated: "2024-01-01T00:00:00Z",
+          commitAuthors: [], commitStats: { scanned: 0, attributed: 0, excluded: 0 },
+        }],
+      }),
+    });
+    expect(edgeBetween(graph, "handle:fixturenew", "handle:fixtureveil")?.incoherent).toBeUndefined();
   });
 });

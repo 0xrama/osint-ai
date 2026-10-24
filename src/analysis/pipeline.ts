@@ -659,7 +659,7 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 	// these, so they must be the subject's — not every handle a scraped page carried.
 	let subjectHandles: string[] = [];
 	try {
-		const preGraph = buildIdentityGraph({ username, webSweep, gitHub, twitter, corpusIdentifiers: localIds, corpusTexts: corpusItems });
+		const preGraph = buildIdentityGraph({ username, webSweep, gitHub, twitter, corpusIdentifiers: localIds, corpusTexts: corpusItems, candidateName: candidate?.name, archivePass });
 		const subjectNodes = new Set(preGraph.persons.find((p) => p.isSubject)?.handleNodes ?? []);
 		subjectHandles = preGraph.nodes.filter((n) => subjectNodes.has(n.id)).map((n) => n.value);
 		const ctx = renderIdentityGraphContextForPrompt(preGraph, username);
@@ -835,6 +835,8 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 			twitter,
 			corpusIdentifiers,
 			corpusTexts: corpusItems,
+			candidateName: candidate?.name,
+			archivePass,
 		}));
 		const subject = identityGraph.persons.find((p) => p.isSubject);
 		log(`[graph] ${identityGraph.persons.length} person entit(ies); subject confidence=${subject?.confidence ?? "n/a"} with ${subject?.handleNodes.length ?? 0} handle(s).`);
@@ -857,6 +859,8 @@ export async function runAudit(opts: AuditOptions, callbacks: AuditCallbacks = {
 			gitHub,
 			twitter,
 			corpusTexts: corpusItems,
+			timezone,
+			ageEstimates,
 		}));
 		const block = renderCorroborationBlock(corroboration);
 		if (block) content = `${content}\n\n---\n${block}`;

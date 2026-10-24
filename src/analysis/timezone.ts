@@ -205,3 +205,67 @@ export function renderTimezoneContextForPrompt(est: TimezoneEstimate): string {
   const fit = `; night-window share ${(est.nightFraction * 100).toFixed(1)}% at best offset vs ${(est.medianNightFraction * 100).toFixed(1)}% at the median offset`;
   return `POSTING-TIME TIMEZONE ESTIMATE (deterministic from ${est.postCount} posts/comments): ${est.label} (confidence: ${est.confidence}${range}${fit}). Use this to corroborate or contradict location claims — it is a longitude band, not a country.`;
 }
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Place → plausible UTC-offset range
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Coarse country/region offset ranges (minutes east of UTC), used to falsify a
+ * profile location against the posting-time fit. Deliberately country-level
+ * and wide where a country spans zones (US, Russia, Australia): the point is to
+ * catch a location on the other side of the world, not to geolocate. A place
+ * absent from the table yields null and never contradicts.
+ */
+const PLACE_OFFSET_RANGES: Array<[RegExp, [number, number]]> = [
+  [/\bindia\b|\bhyderabad\b|\bmumbai\b|\bdelhi\b|\bbengaluru\b|\bbangalore\b|\bchennai\b|\bkolkata\b|\bpune\b|\bgurgaon\b|\bnoida\b|\bahmedabad\b|\bjaipur\b|\blucknow\b/i, [330, 330]],
+  [/\bpakistan\b|\bkarachi\b|\blahore\b|\bislamabad\b/i, [300, 300]],
+  [/\bbangladesh\b|\bdhaka\b/i, [360, 360]],
+  [/\bnepal\b|\bkathmandu\b/i, [345, 345]],
+  [/\bsri lanka\b|\bcolombo\b/i, [330, 330]],
+  [/\buk\b|\bunited kingdom\b|\blondon\b|\bmanchester\b|\bbirmingham\b|\bedinburgh\b|\bglasgow\b|\bdublin\b|\bireland\b|\bportugal\b|\blisbon\b/i, [0, 60]],
+  [/\bgermany\b|\bfrance\b|\bnetherlands\b|\bspain\b|\bitaly\b|\bpoland\b|\bsweden\b|\bnorway\b|\bdenmark\b|\bswitzerland\b|\baustria\b|\bbelgium\b|\bczech\b|\bberlin\b|\bparis\b|\bamsterdam\b|\bmadrid\b|\bbarcelona\b|\brome\b|\bmilan\b|\bwarsaw\b|\bstockholm\b|\bmunich\b|\bvienna\b|\bzurich\b/i, [60, 120]],
+  [/\bgreece\b|\bfinland\b|\bromania\b|\bbulgaria\b|\bturkey\b|\bisrael\b|\bukraine\b|\bkyiv\b|\bathens\b|\bhelsinki\b|\bbucharest\b|\bistanbul\b|\btel aviv\b/i, [120, 180]],
+  [/\brussia\b|\bmoscow\b|\bsaint petersburg\b/i, [120, 720]],
+  [/\buae\b|\bdubai\b|\babu dhabi\b|\bsaudi\b|\briyadh\b|\bqatar\b|\bdoha\b|\bkuwait\b|\bbahrain\b|\boman\b/i, [180, 240]],
+  [/\biran\b|\btehran\b/i, [210, 210]],
+  [/\bjapan\b|\btokyo\b|\bsouth korea\b|\bseoul\b/i, [540, 540]],
+  [/\bchina\b|\bshanghai\b|\bbeijing\b|\bsingapore\b|\bhong kong\b|\btaiwan\b|\btaipei\b|\bphilippines\b|\bmanila\b|\bmalaysia\b|\bkuala lumpur\b/i, [480, 480]],
+  [/\bindonesia\b|\bjakarta\b/i, [420, 540]],
+  [/\bthailand\b|\bbangkok\b|\bvietnam\b|\bhanoi\b|\bho chi minh\b/i, [420, 420]],
+  [/\baustralia\b|\bsydney\b|\bmelbourne\b|\bbrisbane\b|\bperth\b|\badelaide\b/i, [480, 660]],
+  [/\bnew zealand\b|\bauckland\b|\bwellington\b/i, [720, 780]],
+  [/\bbrazil\b|\bsao paulo\b|\brio de janeiro\b/i, [-300, -120]],
+  [/\bargentina\b|\bbuenos aires\b/i, [-180, -180]],
+  [/\bmexico\b|\bmexico city\b/i, [-480, -360]],
+  [/\bunited states\b|\busa\b|\bnew york\b|\bsan francisco\b|\bseattle\b|\baustin\b|\bchicago\b|\bboston\b|\blos angeles\b|\bdenver\b|\batlanta\b|\bdallas\b/i, [-600, -240]],
+  [/\bcanada\b|\btoronto\b|\bvancouver\b|\bmontreal\b/i, [-480, -210]],
+  [/\bsouth africa\b|\bcape town\b|\bjohannesburg\b/i, [120, 120]],
+  [/\bnigeria\b|\blagos\b|\babuja\b/i, [60, 60]],
+  [/\bkenya\b|\bnairobi\b/i, [180, 180]],
+  [/\begypt\b|\bcairo\b/i, [120, 120]],
+];
+
+/** Plausible UTC-offset range (minutes) for a place string, or null. */
+export function placeOffsetRange(place: string): [number, number] | null {
+  for (const [re, range] of PLACE_OFFSET_RANGES) {
+    if (re.test(place)) return range;
+  }
+  return null;
+}
+
+/** Slack (minutes) allowed outside a place's range before it counts as a
+ *  conflict — wide enough to absorb a sleep-schedule shift or a border town. */
+export const TIMEZONE_CONFLICT_SLACK_MINUTES = 180;
+
+/**
+ * Does the posting-time fit conflict with a stated place? True only when the
+ * place is known AND the fit sits more than the slack outside its plausible
+ * offset range. Pure.
+ */
+export function timezoneConflictsWithPlace(offsetMinutes: number, place: string): boolean {
+  const range = placeOffsetRange(place);
+  if (!range) return false;
+  return offsetMinutes < range[0] - TIMEZONE_CONFLICT_SLACK_MINUTES ||
+    offsetMinutes > range[1] + TIMEZONE_CONFLICT_SLACK_MINUTES;
+}

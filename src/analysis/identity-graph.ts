@@ -38,6 +38,16 @@
  *     owner but sites are too cheap to merge identities around. `name-of`
  *     DOES merge at 0.8: a real-name leak on a platform profile is a strong
  *     person-level join.
+ *   - Fusion is not flat: each node's LINKAGE to the audited node is the
+ *     strongest max-product path over merging edges (transitivity decays — a
+ *     chain of two 0.6 bridges scores 0.36, one 1.0 anchor scores 1.0). Nodes
+ *     below 0.5 split off as leads instead of joining the subject, so a weak
+ *     chain can no longer drag a blob into the subject person.
+ *   - Persons are RANKED by support (linkage + identifier kinds + platform
+ *     breadth − contradicted bridges + a supplied candidate-name match). The
+ *     margin to the runner-up is reported: a namesake outranking the subject
+ *     means the bridge evidence is weak. `--subject-name` is a candidate the
+ *     ranking tests, not an assumption.
  *   - Disclosure edges point AT the audited-username node: the subject
  *     verbally disclosed the handle in their own corpus, which ties that
  *     handle to the audited identity. Emails found in the corpus get the
@@ -51,17 +61,19 @@
 
 import { normalizeHandleKey, type DirectIdentifiers, type SocialHandle } from "./extract.ts";
 import { isDriftVariant } from "./handle-drift.ts";
-import { rankHandles, type WebSweepResult } from "./web-sweep.ts";
+import { rankHandles, profileRootHandle, type WebSweepResult } from "./web-sweep.ts";
 import {
-  disclosesHandle,
+  disclosureKind,
   isContentlessEmail,
   isRoleMailbox,
   isSeededHandleWord,
   nameLooksReal,
+  namesOverlap,
   snippetAround,
 } from "./match.ts";
 import type { GitHubPassResult } from "./github-pass.ts";
 import type { TwitterPassResult } from "./twitter-pass.ts";
+import type { ArchivePassResult } from "./archive-pass.ts";
 
 /* ────────────────────────────────────────────────────────────────────────
  * Types
@@ -97,6 +109,12 @@ export interface IdentityGraphEdge {
   strength: number;
   /** Evidence URLs, capped at 3. */
   evidence: string[];
+  /** The subject's own posts contradict the linked profile's location/employer:
+   *  recorded as a lead, downgraded below the merge line. */
+  contradicted?: boolean;
+  /** The rename is chronologically implausible: the "new" account was created
+   *  long after the old handle's last archived activity. */
+  incoherent?: boolean;
 }
 
 export interface PersonEntity {
@@ -107,6 +125,14 @@ export interface PersonEntity {
   confidence: "high" | "medium" | "low";
   /** Strongest edge strength inside the component (0 when singleton). */
   strongestEdge: number;
+  /** 0..1 — strongest max-product path from the audited node to any member
+   *  (1 for the audited node alone, 0 for a namesake). */
+  linkage: number;
+  /** Ranking support: linkage + cross-type coherence + platform breadth −
+   *  contradicted edges (+ a supplied candidate-name match). */
+  support: number;
+  /** The supplied `--subject-name` matches this person's names. */
+  candidateMatch?: boolean;
   /** True for the component containing the audited username's node. */
   isSubject: boolean;
 }
@@ -115,6 +141,10 @@ export interface IdentityGraph {
   nodes: IdentityGraphNode[];
   edges: IdentityGraphEdge[];
   persons: PersonEntity[];
+  /** Support gap between the top-ranked person and the runner-up (0 when the
+   *  graph holds fewer than two persons). Check `persons[0].isSubject` to know
+   *  who leads — a namesake on top means the bridge evidence is weak. */
+  margin: number;
 }
 
 export interface IdentityGraphInput {
@@ -125,6 +155,11 @@ export interface IdentityGraphInput {
   corpusIdentifiers?: DirectIdentifiers;
   /** Corpus items scanned for verbal handle disclosures (permalink = evidence). */
   corpusTexts?: Array<{ text: string; permalink?: string }>;
+  /** Supplied candidate identity (`--subject-name`) — a hypothesis the ranking
+   *  tests rather than assumes. */
+  candidateName?: string;
+  /** Wayback capture history — dates a rename against the accounts' creation. */
+  archivePass?: ArchivePassResult;
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -152,36 +187,50 @@ function nameKey(name: string): string {
 /* Subject self-statements of residence / employer in their own posts.
  * Residence only ("I'm from X" is origin, which a profile location need not
  * match); the captured phrase is a run of capitalized words. */
-const SELF_LOCATION_RE = /\b[Ii](?:'m| am)? (?:live|living|based|moved) (?:in|to) ((?:\p{Lu}[\p{L}'-]+[ ,]*)+)/gu;
-const SELF_EMPLOYER_RE = /\b[Ii](?:'m| am)? (?:work|working) (?:at|for) ((?:\p{Lu}[\p{L}&'.-]*[ ]?)+)/gu;
+const SELF_LOCATION_RE = /\b[Ii](?:'m| am)? (?:live|living|based|moved|relocated|currently) (?:in|to|out of|near) ((?:\p{Lu}[\p{L}'-]+[ ,]*)+)/gu;
+const SELF_EMPLOYER_RE = /\b[Ii](?:'m| am)? (?:work|working|study|studying|intern|interning) (?:at|for) ((?:\p{Lu}[\p{L}&'.-]*[ ]?)+)/gu;
 
 function placeTokens(s: string): string[] {
   return s.toLowerCase().split(/[^\p{L}]+/u).filter((t) => t.length >= 3);
 }
 
-/**
- * True when the subject's own posts state a residence/employer that the
- * profile's location/company shares no word with, and no stated value agrees
- * with the profile. A username-only string match carries no evidence of its
- * own, so this negative evidence is enough to keep its fields out of the
- * subject person.
- */
-function profileContradictsCorpus(
-  profile: { location?: string; company?: string },
-  corpusTexts: Array<{ text: string }>,
-): boolean {
-  let mismatch = false;
-  for (const [field, re] of [[profile.location, SELF_LOCATION_RE], [profile.company, SELF_EMPLOYER_RE]] as const) {
-    const fieldTokens = placeTokens(field ?? "");
-    if (fieldTokens.length === 0) continue;
-    for (const { text } of corpusTexts) {
-      for (const m of text.matchAll(re)) {
-        if (placeTokens(m[1]).some((t) => fieldTokens.includes(t))) return false;
-        mismatch = true;
-      }
-    }
+type ProfileAgreement = "agree" | "conflict" | "unknown";
+
+/** Extract every residence / employer the subject states, once per graph build
+ *  (the corpus can be thousands of items and every bridged profile is checked
+ *  against it). */
+function statedValues(corpusTexts: Array<{ text: string }>): { places: string[]; employers: string[] } {
+  const places: string[] = [];
+  const employers: string[] = [];
+  for (const { text } of corpusTexts) {
+    for (const m of text.matchAll(SELF_LOCATION_RE)) places.push(m[1]);
+    for (const m of text.matchAll(SELF_EMPLOYER_RE)) employers.push(m[1]);
   }
-  return mismatch;
+  return { places, employers };
+}
+
+/**
+ * Compare a profile's location/company against the subject's own residence and
+ * employer statements. Agreement on any field wins; `conflict` needs the
+ * subject to have stated a value for a field and NONE of them to agree;
+ * `unknown` when the subject said nothing usable. A username-only string match
+ * carries no evidence of its own, so `conflict` is enough to keep the profile's
+ * fields out of the subject person.
+ */
+function profileAgreement(
+  profile: { location?: string; company?: string },
+  stated: { places: string[]; employers: string[] },
+): ProfileAgreement {
+  let agreed = false;
+  let conflicted = false;
+  for (const [field, values] of [[profile.location, stated.places], [profile.company, stated.employers]] as const) {
+    const fieldTokens = placeTokens(field ?? "");
+    if (fieldTokens.length === 0 || values.length === 0) continue;
+    if (values.some((v) => placeTokens(v).some((t) => fieldTokens.includes(t)))) agreed = true;
+    else conflicted = true;
+  }
+  if (agreed) return "agree";
+  return conflicted ? "conflict" : "unknown";
 }
 
 /* Edge strengths — fixed by edge semantics (see module JSDoc); `rename`
@@ -189,17 +238,30 @@ function profileContradictsCorpus(
 const STRENGTH = {
   rename: 0.7,
   anchorRename: 1.0,
-  drift: 0.6,
+  drift: 0.7,
   disclosure: 0.8,
   emailOf: 0.9,
-  emailLocalPart: 0.6,
+  emailLocalPart: 0.7,
   nameOf: 0.8,
   siteOf: 0.7,
+  /** Recorded but below the merge line: an ambient mention, a third-party
+   *  disclosure, or a bridge the subject's own posts contradict. */
+  lead: 0.45,
 } as const;
 
 /** Edges below this strength never fuse nodes; `site-of` never fuses. */
 const MERGE_MIN_STRENGTH = 0.6;
 const NON_MERGING_KINDS = new Set<IdentityGraphEdgeKind>(["site-of"]);
+
+/** A node joins the subject person only when its max-product path from the
+ *  audited node reaches this. Every traversed edge is ≥ MERGE_MIN_STRENGTH, so
+ *  one hop always clears it and a chain of two weak (0.6) bridges does not —
+ *  that is the point: transitivity decays. */
+const LINK_FLOOR = 0.5;
+
+/** Slack allowed between the old handle's last archived capture and the new
+ *  account's creation before a rename reads as chronologically implausible. */
+const RENAME_SLACK_MS = 365.25 * 86_400_000;
 
 /* ────────────────────────────────────────────────────────────────────────
  * Graph construction
@@ -222,21 +284,26 @@ interface HandleBucket {
  * Edge semantics shipped:
  *   - `rename` (the bridge entry's sweep confidence, 0.7 when absent): a
  *     page owned by handle B mentions the target handle — the stale-badge
- *     bridge. Owner (current identity) → target (stale). A one-way
- *     third-party mention (0.5) is recorded but never merges persons.
+ *     bridge. Owner (current identity) → target (stale). The confidence
+ *     already encodes the mention class: an ambient mention with no rename
+ *     cue (a link list, a shoutout) scores 0.45 and never merges; a
+ *     self-reference ("formerly X") on a third-party page is 0.6. A profile
+ *     whose own location/employer the subject's posts contradict is
+ *     downgraded to 0.5 and marked `contradicted`.
  *   - `anchor-rename` (1.0): the strongest bridge variant — a link whose
  *     visible text is the old handle but whose target is a different profile
  *     root. Direction is unambiguous, so is the strength: link target (new)
  *     → label (old), whoever owns the page.
- *   - `drift` (0.6): two handle nodes whose normalized keys are digit/letter
+ *   - `drift` (0.7): two handle nodes whose normalized keys are digit/letter
  *     drift variants (fixtureveil ↔ fixtureve1l), keys ≥5 chars.
  *   - `disclosure` (0.8): the corpus discloses a discovered handle in
  *     handle-shaped context (match.ts disclosesHandle: `@h`, `u/h`, a
  *     profile URL, a platform word nearby) → edge INTO the audited-username
- *     node, tying the handle to the audited identity.
+ *     node, tying the handle to the audited identity. A third-party cue
+ *     ("my friend's github is h") drops it to 0.5 — a lead, not a fusion.
  *     A corpus-extracted email (non-vendor, non-noreply) gets the same
  *     edge, evidence = the permalinks of the posts containing it.
- *   - `email-of` (0.9 GitHub profile/commit email; 0.6 email local-part
+ *   - `email-of` (0.9 GitHub profile/commit email; 0.7 email local-part
  *     heuristic or own-domain address — published on its own domain, owned
  *     by the site-of handle or the handle the domain spells): email belongs
  *     to the handle's owner.
@@ -461,27 +528,87 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
     }
   }
 
+  // 5a-bis. Negative evidence, generalized: a bridged handle whose OWN profile
+  // states a location/employer the subject's posts contradict is a namesake, not
+  // a rename. Downgrade it below the merge line and mark it — the node stays in
+  // the graph as a lead, but its fields stop scoring for the subject. Anchor-
+  // renames are exempt: their direction is unambiguous, so a stale profile field
+  // is weaker evidence than the link itself.
+  if (input.corpusTexts?.length) {
+    const stated = statedValues(input.corpusTexts);
+    const profileByKey = new Map<string, { location?: string; company?: string }>();
+    for (const gh of input.gitHub?.identities ?? []) profileByKey.set(normalizeHandleKey(gh.login), gh);
+    for (const res of input.twitter?.results ?? []) {
+      if (res.profile) profileByKey.set(normalizeHandleKey(res.profile.screenName), res.profile);
+    }
+    for (const e of edgeMap.values()) {
+      if (e.kind !== "rename" || e.strength < MERGE_MIN_STRENGTH) continue;
+      const profile = profileByKey.get(e.from.replace(/^handle:/, ""));
+      if (!profile) continue;
+      if (profileAgreement(profile, stated) !== "conflict") continue;
+      e.strength = STRENGTH.lead;
+      e.contradicted = true;
+    }
+  }
+
+  // 5b-bis. Timeline coherence: a rename has an order. The "new" handle's
+  // account must exist before the old handle went quiet (plus a year of slack).
+  // A new account created long AFTER the old handle's last archived capture is
+  // a squatter or a namesake, not a rename. Only fires when both dates exist.
+  if (input.archivePass?.snapshots.length) {
+    const createdByKey = new Map<string, number>();
+    for (const gh of input.gitHub?.identities ?? []) {
+      const t = gh.accountCreated ? Date.parse(gh.accountCreated) : NaN;
+      if (Number.isFinite(t)) createdByKey.set(normalizeHandleKey(gh.login), t);
+    }
+    for (const res of input.twitter?.results ?? []) {
+      const t = res.profile?.createdAtISO ? Date.parse(res.profile.createdAtISO) : NaN;
+      if (Number.isFinite(t) && res.profile) createdByKey.set(normalizeHandleKey(res.profile.screenName), t);
+    }
+    const lastSeenByKey = new Map<string, number>();
+    for (const snap of input.archivePass.snapshots) {
+      const handle = profileRootHandle(/^https?:\/\//i.test(snap.url) ? snap.url : `https://${snap.url}`);
+      if (!handle) continue;
+      const m = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(snap.lastSnapshot);
+      if (!m) continue;
+      const t = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+      const key = normalizeHandleKey(handle);
+      lastSeenByKey.set(key, Math.max(lastSeenByKey.get(key) ?? 0, t));
+    }
+    for (const e of edgeMap.values()) {
+      if (e.kind !== "rename" || e.strength < MERGE_MIN_STRENGTH) continue;
+      const created = createdByKey.get(e.from.replace(/^handle:/, ""));
+      const lastSeen = lastSeenByKey.get(e.to.replace(/^handle:/, ""));
+      if (created === undefined || lastSeen === undefined) continue;
+      if (created - lastSeen <= RENAME_SLACK_MS) continue;
+      e.strength = STRENGTH.lead;
+      e.incoherent = true;
+    }
+  }
+
   // 5c. disclosure: the subject verbally mentioned a discovered handle in
   // their own corpus → tie it to the audited identity. Every spelling
   // variant is scanned; plain prose ("I interned at Microsoft") and URL
-  // fragments (/handle/i/x) never count.
+  // fragments (/handle/i/x) never count. A third-party cue ("my friend's
+  // github is h") keeps the edge as a lead below the merge line.
   if (input.corpusTexts?.length) {
     for (const [key, node] of handleNodes) {
       if (key === auditedKey || key.length < 4 || isSeededHandleWord(key)) continue;
       const variants = buckets.get(key)?.variants ?? [node.value];
       const evidence: string[] = [];
+      let thirdParty = true;
       for (const item of input.corpusTexts) {
         for (const variant of variants) {
-          const idx = disclosesHandle(item.text, variant);
-          if (idx >= 0) {
-            evidence.push(item.permalink ?? snippetAround(item.text, idx, variant.length));
-            break;
-          }
+          const hit = disclosureKind(item.text, variant);
+          if (!hit) continue;
+          if (hit.kind === "self") thirdParty = false;
+          evidence.push(item.permalink ?? snippetAround(item.text, hit.index, variant.length));
+          break;
         }
         if (evidence.length >= 3) break;
       }
       if (evidence.length > 0) {
-        addEdge(node.id, auditedId, "disclosure", STRENGTH.disclosure, evidence);
+        addEdge(node.id, auditedId, "disclosure", thirdParty ? STRENGTH.lead : STRENGTH.disclosure, evidence);
       }
     }
   }
@@ -503,6 +630,7 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
     (e) => (e.kind === "rename" || e.kind === "anchor-rename") && (e.from === auditedId || e.to === auditedId),
   );
   const splitEmails = new Set<string>();
+  const stated = statedValues(input.corpusTexts ?? []);
   const profileNode = (
     platform: string,
     login: string,
@@ -518,7 +646,7 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
         (h) => h.platform === platform && normalizeHandleKey(h.handle) === key,
       ) ||
       emails.some((e) => corpusEmailPermalinks.has(e.toLowerCase()));
-    if (linked || !profileContradictsCorpus(profile, input.corpusTexts ?? [])) return handleNodes.get(key);
+    if (linked || profileAgreement(profile, stated) !== "conflict") return handleNodes.get(key);
     const audited = handleNodes.get(key);
     if (audited) audited.platforms = audited.platforms.filter((p) => p !== platform);
     for (const e of emails) splitEmails.add(e.toLowerCase());
@@ -616,7 +744,38 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
     (a, b) => a.from.localeCompare(b.from) || a.kind.localeCompare(b.kind) || a.to.localeCompare(b.to),
   );
 
-  /* ── 7. Person entities: connected components over merging edges ────── */
+  /* ── 7. Linkage to the audited node (max-product path) ─────────────── */
+  // Transitivity decays: a chain of two 0.6 bridges scores 0.36, one 1.0 anchor
+  // scores 1.0. Only merging edges are traversed, so a lead-strength edge
+  // (ambient mention, third-party disclosure, contradicted bridge) contributes
+  // no linkage at all — it stays a recorded lead.
+  const adjacency = new Map<string, Array<{ to: string; strength: number }>>();
+  const link = (from: string, to: string, strength: number): void => {
+    const list = adjacency.get(from) ?? [];
+    list.push({ to, strength });
+    adjacency.set(from, list);
+  };
+  for (const e of edges) {
+    if (e.strength < MERGE_MIN_STRENGTH || NON_MERGING_KINDS.has(e.kind)) continue;
+    link(e.from, e.to, e.strength);
+    link(e.to, e.from, e.strength);
+  }
+  const linkage = new Map<string, number>([[auditedId, 1]]);
+  const frontier: Array<[string, number]> = [[auditedId, 1]];
+  while (frontier.length > 0) {
+    frontier.sort((a, b) => b[1] - a[1]);
+    const [id, score] = frontier.shift()!;
+    if (score < (linkage.get(id) ?? 0)) continue;
+    for (const nb of adjacency.get(id) ?? []) {
+      const next = score * nb.strength;
+      if (next <= (linkage.get(nb.to) ?? 0) + 1e-9) continue;
+      linkage.set(nb.to, next);
+      frontier.push([nb.to, next]);
+    }
+  }
+  const isLinked = (id: string): boolean => (linkage.get(id) ?? 0) >= LINK_FLOOR;
+
+  /* ── 8. Person entities: components over merging edges, split at the floor ── */
   const parent = new Map<string, string>(nodes.map((n) => [n.id, n.id]));
   const find = (id: string): string => {
     let root = id;
@@ -629,7 +788,10 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
     if (ra !== rb) parent.set(ra, rb);
   };
   for (const e of edges) {
-    if (e.strength >= MERGE_MIN_STRENGTH && !NON_MERGING_KINDS.has(e.kind)) union(e.from, e.to);
+    if (e.strength < MERGE_MIN_STRENGTH || NON_MERGING_KINDS.has(e.kind)) continue;
+    // Both ends linked → subject side; neither → a namesake cluster; mixed →
+    // the unlinked end is demoted to a lead and splits off.
+    if (isLinked(e.from) === isLinked(e.to)) union(e.from, e.to);
   }
   const components = new Map<string, string[]>();
   for (const n of nodes) {
@@ -665,6 +827,12 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
     const kinds = new Set(eligible.map((e) => e.kind));
     const confidence: PersonEntity["confidence"] =
       kinds.size >= 2 || hasBridgeOwner ? "high" : eligible.length >= 2 ? "medium" : "low";
+    // Linkage = the strongest tie to the audited node other than the audited
+    // node itself (which is always 1). Namesakes score 0.
+    const memberLinkage = sorted.filter((id) => id !== auditedId).map((id) => linkage.get(id) ?? 0);
+    const personLinkage = isSubject ? (memberLinkage.length > 0 ? Math.max(...memberLinkage) : 1) : 0;
+    const candidateMatch = !!input.candidateName &&
+      sorted.some((id) => id.startsWith("name:") && namesOverlap(nodeById.get(id)?.value ?? "", input.candidateName!));
     persons.push({
       id: `person:${sorted[0]}`,
       handleNodes: sorted.filter((id) => id.startsWith("handle:")),
@@ -672,12 +840,49 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
       nameNodes: sorted.filter((id) => id.startsWith("name:")),
       confidence,
       strongestEdge: internal.reduce((max, e) => Math.max(max, e.strength), 0),
+      linkage: round2(personLinkage),
+      support: 0,
+      candidateMatch,
       isSubject,
     });
   }
-  persons.sort((a, b) => Number(b.isSubject) - Number(a.isSubject) || a.id.localeCompare(b.id));
 
-  return { nodes, edges, persons };
+  /* ── 9. Support ranking (competing hypotheses) ─────────────────────── */
+  // Support answers "how good is this person as an explanation of the audited
+  // account?": the tie to the account (linkage), how many KINDS of identifier
+  // the person carries (a name + email + handle is a whole person, a lone
+  // handle is a string), platform breadth, minus contradicted bridges, plus a
+  // supplied candidate-name match. The margin to the runner-up is the point —
+  // a namesake that outranks the subject means the bridge evidence is weak.
+  for (const p of persons) {
+    const memberSet = new Set([...p.handleNodes, ...p.emailNodes, ...p.nameNodes]);
+    const kinds = [p.handleNodes.length, p.emailNodes.length, p.nameNodes.length].filter((n) => n > 0).length;
+    const platforms = new Set(
+      p.handleNodes
+        .filter((id) => id !== auditedId)
+        .flatMap((id) => nodeById.get(id)?.platforms ?? [])
+        // "web" is the synthetic tag for bridge-only nodes, not a platform.
+        .filter((platform) => platform !== "web"),
+    );
+    const contradicted = edges.filter(
+      (e) => (e.contradicted || e.incoherent) && (memberSet.has(e.from) || memberSet.has(e.to)),
+    ).length;
+    p.support = round2(
+      p.linkage * 4 + kinds + Math.min(platforms.size, 3) * 0.5 - contradicted * 1.5 +
+        (p.candidateMatch ? 1.5 : 0),
+    );
+  }
+  persons.sort(
+    (a, b) => b.support - a.support || Number(b.isSubject) - Number(a.isSubject) || a.id.localeCompare(b.id),
+  );
+  const margin = persons.length >= 2 ? round2(persons[0].support - persons[1].support) : 0;
+
+  return { nodes, edges, persons, margin };
+}
+
+/** Round to 2 decimals (stable support/linkage values). */
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 /* ────────────────────────────────────────────────────────────────────────
@@ -686,6 +891,16 @@ export function buildIdentityGraph(input: IdentityGraphInput): IdentityGraph {
 
 function shortValue(id: string, nodeById: Map<string, IdentityGraphNode>): string {
   return nodeById.get(id)?.value ?? id;
+}
+
+/** One-line label for a non-subject person (handles, then emails/names). */
+function personLabel(person: PersonEntity, nodeById: Map<string, IdentityGraphNode>): string {
+  const parts = [
+    ...person.handleNodes.map((id) => `\`${shortValue(id, nodeById)}\``),
+    ...person.emailNodes.map((id) => `\`${shortValue(id, nodeById)}\``),
+    ...person.nameNodes.map((id) => shortValue(id, nodeById)),
+  ];
+  return parts.join(", ") || person.id;
 }
 
 /** Handles that are the CURRENT end of a rename edge inside the person —
@@ -717,6 +932,12 @@ export function renderIdentityGraphBlock(graph: IdentityGraph, username: string)
   const nodeById = new Map(graph.nodes.map((n) => [n.id, n]));
   const memberSet = new Set(subject.handleNodes.concat(subject.emailNodes, subject.nameNodes));
   const internalEdges = graph.edges.filter((e) => memberSet.has(e.from) && memberSet.has(e.to));
+  // A contradicted or incoherent rename no longer merges, so its other end is a
+  // namesake — surface it on the subject anyway: it is the reason the namesake
+  // is separate.
+  const contradictedEdges = graph.edges.filter(
+    (e) => (e.contradicted || e.incoherent) && (memberSet.has(e.from) || memberSet.has(e.to)),
+  );
 
   const lines: string[] = [];
   lines.push("## Identity Graph");
@@ -725,7 +946,7 @@ export function renderIdentityGraphBlock(graph: IdentityGraph, username: string)
     `*Person-level fusion computed deterministically from the pass results (rename bridges, handle clusters and drift, corpus disclosures, GitHub/Twitter profile fields). Every identifier below carries its fusion evidence; separate persons are explicitly NOT u/${username}.*`,
   );
   lines.push("");
-  lines.push(`### Subject person — u/${username} (confidence: ${subject.confidence})`);
+  lines.push(`### Subject person — u/${username} (confidence: ${subject.confidence}, linkage: ${subject.linkage.toFixed(2)})`);
   lines.push("");
   for (const id of currentIdentityFirst(subject, graph.edges)) {
     const n = nodeById.get(id);
@@ -742,8 +963,34 @@ export function renderIdentityGraphBlock(graph: IdentityGraph, username: string)
 
   lines.push("");
   lines.push("Fusion edges:");
-  for (const e of internalEdges) {
-    lines.push(`- ${shortValue(e.from, nodeById)} ─${e.kind}(${e.strength.toFixed(1)})→ ${shortValue(e.to, nodeById)}`);
+  for (const e of [...internalEdges, ...contradictedEdges]) {
+    const flag = e.contradicted ? " — contradicted by the subject's own posts"
+      : e.incoherent ? " — chronologically implausible rename" : "";
+    lines.push(`- ${shortValue(e.from, nodeById)} ─${e.kind}(${e.strength.toFixed(1)})→ ${shortValue(e.to, nodeById)}${flag}`);
+  }
+
+  // Competing hypotheses: every person ranked by support, with the margin.
+  // A namesake above the subject means the bridge evidence is weak — the
+  // analyst must verify before naming anyone.
+  if (graph.persons.length > 1) {
+    lines.push("");
+    lines.push("### Candidate ranking (support = linkage + identifier kinds + platform breadth − contradictions)");
+    lines.push("");
+    graph.persons.forEach((p, i) => {
+      const label = p.isSubject ? `u/${username} (subject person)` : personLabel(p, nodeById);
+      const flags = [
+        p.candidateMatch ? "candidate-name match" : "",
+        p.linkage === 0 ? "not tied to the account" : "",
+      ].filter(Boolean).join(", ");
+      lines.push(`- #${i + 1} **${label}** — support ${p.support.toFixed(2)}, linkage ${p.linkage.toFixed(2)}${flags ? ` (${flags})` : ""}`);
+    });
+    lines.push("");
+    const top = graph.persons[0];
+    lines.push(
+      top.isSubject
+        ? `Margin over the runner-up: **${graph.margin.toFixed(2)}** — the subject person leads.`
+        : `Margin: **${graph.margin.toFixed(2)}** — **a namesake outranks the subject person**; the bridge evidence is weak and must be verified before naming anyone.`,
+    );
   }
 
   const namesakes = graph.persons.filter((p) => !p.isSubject);
@@ -812,6 +1059,18 @@ export function renderIdentityGraphContextForPrompt(graph: IdentityGraph, userna
   if (namesakes.length > 0) {
     lines.push(
       `- Namesakes (NOT u/${username} — never attribute their activity, posts, or identifiers to the subject): ${namesakes.join("; ")}`,
+    );
+  }
+  if (graph.persons.length > 1) {
+    const ranking = graph.persons.map((p, i) =>
+      `#${i + 1} ${p.isSubject ? `u/${username} (subject)` : personLabel(p, nodeById)} support ${p.support.toFixed(2)}${p.candidateMatch ? " [candidate-name match]" : ""}`,
+    );
+    lines.push(`- Candidate ranking: ${ranking.join("; ")}`);
+    const top = graph.persons[0];
+    lines.push(
+      top.isSubject
+        ? `- Margin over the runner-up: ${graph.margin.toFixed(2)} — the subject person leads.`
+        : `- Margin: ${graph.margin.toFixed(2)} — a namesake outranks the subject person; verify the bridge before naming anyone.`,
     );
   }
   return lines.join("\n");

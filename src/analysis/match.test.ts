@@ -6,6 +6,8 @@
 
 import { describe, expect, test } from "bun:test";
 import {
+  classifyMention,
+  disclosureKind,
   disclosesHandle,
   findHandleMentions,
   isContentlessEmail,
@@ -78,6 +80,40 @@ describe("disclosesHandle (disclosure mode)", () => {
       expect(disclosesHandle(text, handle) >= 0).toBe(want);
     });
   }
+});
+
+describe("classifyMention (bridge mode)", () => {
+  const cases: Array<[string, string, "self-reference" | "ambient"]> = [
+    ["Previously known as fixtureveil", "fixtureveil", "self-reference"],
+    ["formerly fixtureveil, now elsewhere", "fixtureveil", "self-reference"],
+    ["my old account was fixtureveil", "fixtureveil", "self-reference"],
+    ["find me now as fixtureveil", "fixtureveil", "self-reference"],
+    ["Reddit: fixtureveil", "fixtureveil", "self-reference"],
+    // a link list / shoutout names the handle without claiming it
+    ["People worth following: fixtureveil, otherdev, thirddev", "fixtureveil", "ambient"],
+    ["inspired by fixtureveil and others", "fixtureveil", "ambient"],
+    // a third-party cue beats the nearby platform word
+    ["my friend's github is fixtureveil", "fixtureveil", "ambient"],
+  ];
+  for (const [text, handle, want] of cases) {
+    test(`${JSON.stringify(text)} → ${want}`, () => {
+      expect(classifyMention(text, handle)).toBe(want);
+    });
+  }
+});
+
+describe("disclosureKind (disclosure mode)", () => {
+  test("first-person possession is a self disclosure", () => {
+    expect(disclosureKind("my github is nightowl42", "nightowl42")).toEqual({ kind: "self", index: 13 });
+  });
+
+  test("a third-party cue downgrades the disclosure", () => {
+    expect(disclosureKind("my friend's github is nightowl42", "nightowl42")?.kind).toBe("third-party");
+  });
+
+  test("a bare prose mention is not a disclosure", () => {
+    expect(disclosureKind("I interned at Microsoft", "microsoft")).toBeNull();
+  });
 });
 
 describe("statesResidence (first-person residence)", () => {

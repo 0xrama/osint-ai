@@ -383,6 +383,54 @@ describe("contradiction detection", () => {
     ).toBe(true);
   });
 
+  test("a posting-time fit on the other side of the world contradicts a location", () => {
+    const res = run({
+      structured: mkStructured([mkFinding("location", "Hyderabad", ["https://reddit.com/r/1"])]),
+      timezone: {
+        offsetMinutes: -300, label: "UTC-05:00", postCount: 50, confidence: "high",
+        nightFraction: 0.05, plateauFromMinutes: -300, plateauToMinutes: -300,
+        medianNightFraction: 0.2, localHourHistogram: Array(24).fill(2),
+      },
+    });
+    expect(res.contradictions.some((c) => c.includes("Posting-time fit UTC-05:00 conflicts with location"))).toBe(true);
+    // The fit is itself a cluster, but never a strong identity anchor.
+    expect(res.clusters.some((c) => c.signalType === "timezone")).toBe(true);
+  });
+
+  test("a low-confidence fit never contradicts", () => {
+    const res = run({
+      structured: mkStructured([mkFinding("location", "Hyderabad", ["https://reddit.com/r/1"])]),
+      timezone: {
+        offsetMinutes: -300, label: "UTC-05:00", postCount: 12, confidence: "low",
+        nightFraction: 0.05, plateauFromMinutes: -300, plateauToMinutes: -300,
+        medianNightFraction: 0.2, localHourHistogram: Array(24).fill(2),
+      },
+    });
+    expect(res.contradictions.some((c) => c.includes("Posting-time fit"))).toBe(false);
+  });
+
+  test("a model age far from the deterministic timeline contradicts", () => {
+    const res = run({
+      structured: mkStructured([mkFinding("age_or_dob", "31", ["https://reddit.com/r/1"])]),
+      ageEstimates: [{
+        birthYearRange: [2004, 2005], ageRange: [20, 21], chain: "test",
+        basis: "2nd year", program: "bachelor", confidence: "medium",
+      }],
+    });
+    expect(res.contradictions.some((c) => c.includes("conflicts with the deterministic timeline"))).toBe(true);
+  });
+
+  test("an age inside the deterministic range does not contradict", () => {
+    const res = run({
+      structured: mkStructured([mkFinding("age_or_dob", "21", ["https://reddit.com/r/1"])]),
+      ageEstimates: [{
+        birthYearRange: [2004, 2005], ageRange: [20, 21], chain: "test",
+        basis: "2nd year", program: "bachelor", confidence: "medium",
+      }],
+    });
+    expect(res.contradictions.some((c) => c.includes("deterministic timeline"))).toBe(false);
+  });
+
   test("two disjoint real names both sourced flag a contradiction", () => {
     const res = run({
       structured: mkStructured([
